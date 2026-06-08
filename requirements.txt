@@ -1,0 +1,3 @@
+# Required only for --venn in compare_gtf.py
+matplotlib
+matplotlib-venn

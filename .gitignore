@@ -3,3 +3,4 @@ gtfparse
 
 *.env
 *.gtf
+*.gff

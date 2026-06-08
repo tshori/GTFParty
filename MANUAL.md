@@ -16,7 +16,10 @@ Written alongside the code as a learning companion.
 7. [compare.h and compare.c — the comparison layer](#7-compareh-and-comparec--the-comparison-layer)
 8. [Pointers — a complete picture](#8-pointers--a-complete-picture)
 9. [Memory lifetimes and dangling pointers](#9-memory-lifetimes-and-dangling-pointers)
-10. [Known limitations and what Step 2 fixes](#10-known-limitations-and-what-step-2-fixes)
+10. [Current limitations](#10-current-limitations)
+11. [GtfTable — a dynamic array of records](#11-gtftable--a-dynamic-array-of-records)
+12. [filter — using GtfTable in a command](#12-filter--using-gtftable-in-a-command)
+13. [GtfAttrs — parsing the attributes column](#13-gtfattrs--parsing-the-attributes-column)
 
 ---
 
@@ -212,8 +215,9 @@ as a local variable, the compiler reserves exactly `sizeof(GtfRecord)` bytes
 on the stack.
 
 The trade-off: any string longer than 255 characters (plus null terminator)
-will be silently truncated. Step 2 replaces these arrays with `char *` heap
-pointers to remove that limit.
+will be silently truncated. In practice, NCBI RefSeq GTF files fit within
+these limits. A future step could replace these arrays with heap-allocated
+`char *` pointers to remove the cap entirely.
 
 **Sentinel values** encode "not applicable" without a separate boolean flag:
 
@@ -245,6 +249,19 @@ function promises not to modify the string it receives.
 `GtfRecord *rec` — a pointer to a `GtfRecord`. The function will write
 results into the struct the caller provides. This is how C functions
 "return" multiple values — pass a pointer to where you want the output.
+
+### GtfTable and GtfAttrs
+
+`gtf.h` also declares two higher-level types built on top of `GtfRecord`:
+
+**`GtfTable`** holds a heap-allocated, dynamically-grown array of every
+record in a file. It is the in-memory representation of the whole file,
+as opposed to streaming one record at a time. See section 11.
+
+**`GtfAttr` / `GtfAttrs`** represent the parsed attributes column: a
+dynamic array of `{char *key; char *value;}` pairs allocated on the heap
+on demand. Rather than scanning the raw attribute string each time you need
+a value, you parse once and look up by key. See section 13.
 
 ---
 
@@ -431,13 +448,24 @@ int main(int argc, char *argv[])
 
     const char *cmd = argv[1];
 
-    /* compare takes two file arguments — check before the generic path */
+    /* compare: two file arguments */
     if (strcmp(cmd, "compare") == 0) {
         if (argc < 4) { ... }
         return cmd_compare(argv[2], argv[3]);
     }
 
-    /* all other commands take one file argument */
+    /* filter / attrs: one string argument then a file */
+    if (strcmp(cmd, "filter") == 0 || strcmp(cmd, "attrs") == 0) {
+        if (argc < 4) { ... }
+        FILE *fp = fopen(argv[3], "r");
+        int rc = (strcmp(cmd, "filter") == 0)
+                 ? cmd_filter(fp, argv[2])
+                 : cmd_attrs(fp, argv[2]);
+        fclose(fp);
+        return rc;
+    }
+
+    /* print / stats: one file argument */
     if (argc < 3) { usage(argv[0]); return 1; }
     FILE *fp = fopen(argv[2], "r");
     // ...
@@ -468,11 +496,35 @@ and `bedtools`. The key advantage over flags (`-p`, `-s`) is that each
 subcommand can grow its own options later without polluting a shared flag
 namespace.
 
-`compare` is checked first because it has a different argument count (two
-files instead of one). Handling special cases before the general path is
-a common C idiom: fall through to the shared code only when the special
-cases do not apply. This is why the `argc < 3` guard appears *after* the
-`compare` block — for `compare`, we need `argc >= 4`, not `argc >= 3`.
+**Three argument shapes.** Commands fall into three groups based on how
+many arguments they need, and the shapes are checked from most-specific to
+least-specific:
+
+| Shape | Commands | `argv` layout |
+|-------|----------|---------------|
+| Two files | `compare` | `argv[2]`, `argv[3]` are both files |
+| String + file | `filter`, `attrs` | `argv[2]` is a string, `argv[3]` is a file |
+| One file | `print`, `stats` | `argv[2]` is a file |
+
+Checking the special cases first is a common C idiom: each block either
+returns or falls through to the next, so the final `fopen(argv[2])` is only
+reached by commands that actually take exactly one file argument. If `compare`
+were not checked first, `fopen(argv[2])` would try to open `"a.gtf"` as the
+file for a two-file command — wrong.
+
+**Sharing a dispatch case.** `filter` and `attrs` have identical argument
+shapes (`<string> <file>`), so they are handled by a single `if` block.
+A ternary chooses which function to call:
+
+```c
+int rc = (strcmp(cmd, "filter") == 0)
+         ? cmd_filter(fp, argv[2])
+         : cmd_attrs(fp, argv[2]);
+```
+
+This is cleaner than duplicating the `fopen`/`fclose` pair. The pattern
+scales: when a third command with the same shape is added, only the ternary
+needs to grow.
 
 ### Splitting the commands into static functions
 
@@ -1331,50 +1383,476 @@ addresses are returned.
 
 ---
 
-## 10. Known limitations and what Step 2 fixes
+## 10. Current limitations
 
-### Buffer size caps in `GtfRecord`
+This section describes the known constraints of the current code: what has
+been addressed and what remains.
+
+### Buffer size caps in `GtfRecord` — still present
 
 `seqname`, `source`, and `feature` are capped at 255 characters.
 `attributes` is capped at 8191 characters. Any value longer than these
-limits is silently truncated. In practice, GTF files from NCBI RefSeq fit
-within these limits, but the design is fragile.
+limits is silently truncated. In practice, GTF files from NCBI RefSeq
+(tested on 1.7 million records) fit within these limits.
 
-**Fix in Step 2:** replace `char field[N]` with `char *field` and allocate
-exactly as much heap memory as each string needs (`strlen(src) + 1` bytes).
-`stats.c` already demonstrates this pattern — its `TxEntry` arrays grow to
-fit the input rather than being fixed at a compile-time size.
+Removing the cap requires replacing `char field[N]` with `char *field`
+and heap-allocating each string with `malloc(strlen(src) + 1)`. That change
+would turn `GtfRecord` from a value type (copyable by assignment) into a
+type that owns heap memory and must be explicitly freed — a larger API
+change that is deferred to a future step.
 
-### Line length cap
+### Line length cap — still present
 
-`buf[65536]` in the parser limits lines to 65535 characters. GTF attributes
-columns can be long on heavily annotated genomes, but 64 KB is generous
-in practice.
+`buf[65536]` in `gtf_parse_line` limits lines to 65,535 characters. GTF
+attributes columns can be long on heavily annotated genomes, but 64 KB
+is generous in practice. The POSIX `getline()` function allocates a buffer
+large enough for each line dynamically and would remove this limit.
 
-**Fix in Step 2:** use `getline()`, which allocates a buffer large enough
-for each line dynamically.
+### `strtok` is not thread-safe — still present
 
-### `strtok` is not thread-safe
+`strtok` stores its position in a hidden static variable. Calling it from
+two threads simultaneously corrupts both. `strtok_r` (POSIX) takes an
+explicit `char **saveptr` instead and is safe. This matters only if the
+parser is ever called from multiple threads.
 
-`strtok` uses a hidden static pointer. Calling it from two threads
-simultaneously corrupts both calls. `strtok_r` is the thread-safe
-alternative.
+### Dynamic record array — addressed in Step 2
 
-### No attribute parsing in `GtfRecord`
+`GtfTable` (see section 11) provides a heap-allocated, doubling-growth
+array that holds all records from a file in memory. Commands that need
+to make multiple passes over the data (`filter`, `attrs`) load into a
+`GtfTable` rather than streaming line-by-line.
 
-The `attributes` field in `GtfRecord` is stored as a raw string. `stats.c`
-works around this with its own `attr_get` function. If many different
-callers need attribute access, the parsing belongs in the shared `gtf.c`
-layer.
+### Attribute parsing — addressed in Step 4
 
-**Fix in Step 4:** parse `key "value";` pairs into an array of
-`{ char *key; char *value; }` structs inside `GtfRecord`, making attribute
-access O(1) rather than O(attributes length) per lookup.
+`stats.c` had a private `attr_get` function that scanned the raw attribute
+string character by character each time it needed a value. `GtfAttrs`
+(see section 13) provides a public API in the `gtf.c` layer: parse once,
+look up by key, free when done. The `attrs` command demonstrates it.
 
 ### `stats.c` loads all exon records into memory
 
 `gtf_exon_intron_stats` reads all exon lines before computing anything.
 For a genome with tens of millions of exons this may require several hundred
 megabytes. A streaming algorithm that processes records in gene-sorted order
-could reduce this to O(transcripts per gene), but it would require the input
-to be sorted — a requirement the current code does not impose.
+could reduce peak memory to O(transcripts per gene), but it would require
+the input to be sorted — a requirement the current code does not impose.
+
+---
+
+## 11. `GtfTable` — a dynamic array of records
+
+### Why load everything into memory?
+
+The original `cmd_print` streamed the file one line at a time: parse a
+record, print it, discard it, repeat. Streaming uses O(1) memory but limits
+you to a single forward pass. Commands that need to look at all records
+more than once — filtering, sorting, interval queries — require the whole
+file to be in memory first.
+
+`GtfTable` is that in-memory representation. It is the same doubling-growth
+dynamic array pattern introduced in `stats.c` (section 6), but generalised
+to hold `GtfRecord` values instead of private `TxEntry` structs.
+
+### The struct
+
+```c
+typedef struct {
+    GtfRecord *recs;
+    size_t     n;
+    size_t     cap;
+    size_t     n_skipped;
+    size_t     n_errors;
+} GtfTable;
+```
+
+- `recs` — pointer to the heap-allocated array of records.
+- `n` — the number of valid records currently stored.
+- `cap` — the allocated capacity (always `>= n`).
+- `n_skipped` — count of comment and blank lines encountered while loading.
+- `n_errors` — count of lines that failed to parse.
+
+The last two fields carry diagnostic information without requiring the
+caller to maintain separate counters. They are written to `stderr` by
+commands that care (`cmd_print`), and ignored by commands that do not
+(`cmd_filter`, `cmd_attrs`).
+
+### `gtf_table_load`
+
+```c
+GtfTable *gtf_table_load(FILE *fp)
+{
+    GtfTable *t = malloc(sizeof(GtfTable));
+    // ...
+    t->cap  = GTF_TABLE_INIT_CAP;   /* 4096 */
+    t->recs = malloc(t->cap * sizeof(GtfRecord));
+
+    char line[65536];
+    GtfRecord rec;
+
+    while (fgets(line, sizeof(line), fp)) {
+        int ret = gtf_parse_line(line, &rec);
+        if (ret == 1) { t->n_skipped++; continue; }
+        if (ret == -1) { t->n_errors++;  continue; }
+
+        if (t->n >= t->cap) {
+            size_t new_cap = t->cap * 2;
+            GtfRecord *tmp = realloc(t->recs, new_cap * sizeof(GtfRecord));
+            if (!tmp) { gtf_table_free(t); return NULL; }
+            t->recs = tmp;
+            t->cap  = new_cap;
+        }
+        t->recs[t->n++] = rec;
+    }
+    return t;
+}
+```
+
+**Three-way return from `gtf_parse_line`.** The function returns `1` for
+comments/blanks (increment `n_skipped`, continue), `-1` for parse errors
+(increment `n_errors`, continue), and `0` for a valid record. Only `0`
+causes a record to be added to the table.
+
+**Grow before insert.** The capacity check comes *before* storing the new
+record. The invariant is: `t->n < t->cap` at the point of assignment.
+Checking after would risk writing one past the end of the array.
+
+**`realloc` via a temporary.** As explained in section 6, assigning
+`realloc`'s return value directly to `t->recs` would leak the old allocation
+if `realloc` returned `NULL`. The temporary `tmp` avoids this.
+
+**`t->recs[t->n++] = rec` — struct assignment.** C copies a struct by value
+when you assign it with `=`. Every field of `rec` is copied into the next
+slot of the array. After this line, the table's copy is independent of the
+local `rec` — modifying `rec` on the next iteration does not affect what
+was stored.
+
+**Failure path calls `gtf_table_free`.** If `realloc` fails mid-load, we
+call `gtf_table_free(t)` before returning `NULL`. This frees the partially
+filled table rather than leaking it. `gtf_table_free` handles a partially
+initialised `GtfTable` safely because it only frees `t->recs` and `t` — both
+of which are valid at that point.
+
+### `gtf_table_free`
+
+```c
+void gtf_table_free(GtfTable *t)
+{
+    if (!t) return;
+    free(t->recs);
+    free(t);
+}
+```
+
+This is simpler than `cmp_free_transcripts` (section 7) because `GtfRecord`
+is a value type — it contains no pointers to separately allocated memory, so
+there is nothing to free inside each record. A single `free(t->recs)` releases
+the entire array at once.
+
+Compare with `Transcript`, which has an `IntronSpan *introns` pointer in
+each element: that design requires a loop to free each intron array before
+freeing the outer array. `GtfRecord`'s fixed-size embedded arrays avoid
+this complexity, at the cost of the size caps discussed in section 10.
+
+---
+
+## 12. `filter` — using `GtfTable` in a command
+
+`cmd_filter` is the simplest consumer of `GtfTable`:
+
+```c
+static int cmd_filter(FILE *fp, const char *feature)
+{
+    GtfTable *t = gtf_table_load(fp);
+    if (!t) { fprintf(stderr, "error: out of memory\n"); return 1; }
+
+    size_t matched = 0;
+    for (size_t i = 0; i < t->n; i++) {
+        if (strcmp(t->recs[i].feature, feature) == 0) {
+            gtf_print(&t->recs[i]);
+            matched++;
+        }
+    }
+
+    fprintf(stderr, "matched=%zu  total=%zu\n", matched, t->n);
+    gtf_table_free(t);
+    return 0;
+}
+```
+
+There is not much new C here — the interest is in the design pattern. The
+function does not need to know how many records the file has. It loads once,
+iterates once, and prints matching records to `stdout` while reporting
+counts to `stderr`.
+
+**Why not stream?** For filtering alone, streaming would work and use less
+memory. The reason to use `GtfTable` here is consistency: every command in
+this tool works from an in-memory table, which means any command can later
+be extended to make a second pass without changing its file-reading logic.
+When Step 5 (sort) is added, the table will be sorted in place after loading
+— a second pass for free.
+
+**`strcmp` on a struct field.** `t->recs[i].feature` is a `char` array
+embedded in the `GtfRecord`. `strcmp` takes two `const char *` arguments —
+passing an array name decays to a pointer to its first element automatically.
+This is the array-to-pointer decay rule: in most expression contexts, an
+array name becomes a pointer to its first element.
+
+---
+
+## 13. `GtfAttrs` — parsing the attributes column
+
+### The problem with raw string scanning
+
+`stats.c` contains a private `attr_get` function that finds a key's value
+by walking the raw attribute string character by character. It works, but
+it re-scans the whole string for every key you look up. If you need three
+attributes from one record, you scan the string three times.
+
+More importantly, `attr_get` is `static` — private to `stats.c`. Any other
+caller that needs attribute access must either duplicate the function or
+work without it. The `GtfAttrs` API moves attribute parsing into the shared
+`gtf.c` layer where any caller can use it.
+
+### The two structs
+
+```c
+typedef struct {
+    char *key;
+    char *value;
+} GtfAttr;
+
+typedef struct {
+    GtfAttr *pairs;
+    size_t   n;
+} GtfAttrs;
+```
+
+`GtfAttr` holds one key/value pair. Both strings are heap-allocated and
+owned by the pair. `GtfAttrs` holds a dynamic array of pairs. The two types
+form a small two-level ownership tree, similar to the `Transcript`/`IntronSpan`
+relationship in `compare.c`:
+
+```
+GtfAttrs (heap)
+├── pairs[0].key   → "gene_id\0"        (heap)
+├── pairs[0].value → "ENSG00000001\0"   (heap)
+├── pairs[1].key   → "transcript_id\0"  (heap)
+├── pairs[1].value → "ENST00000001\0"   (heap)
+└── ...
+```
+
+Freeing a `GtfAttrs` requires three levels: free each key, free each value,
+free the pairs array, free the struct.
+
+### `strndup_safe` — copying a substring to the heap
+
+The parser needs to copy substrings out of the raw attributes string into
+individual heap allocations. The standard library has `strdup` (duplicate an
+entire string) but not `strndup` on all platforms. We define our own:
+
+```c
+static char *strndup_safe(const char *src, size_t len)
+{
+    char *s = malloc(len + 1);
+    if (!s) return NULL;
+    memcpy(s, src, len);
+    s[len] = '\0';
+    return s;
+}
+```
+
+`malloc(len + 1)` allocates exactly enough bytes for the substring plus its
+null terminator. `memcpy` copies the bytes (it does not stop at `'\0'`, which
+is what we want — we are copying a substring, not a null-terminated string).
+The explicit `s[len] = '\0'` adds the terminator.
+
+This is `static` (private to `gtf.c`) because it is an implementation detail
+with no reason to be visible outside the file.
+
+### `gtf_attrs_parse` — pointer walking
+
+```c
+GtfAttrs *gtf_attrs_parse(const char *raw)
+{
+    GtfAttrs *a = malloc(sizeof(GtfAttrs));
+    // ...
+    a->n = 0;
+    a->pairs = malloc(GTF_ATTRS_INIT_CAP * sizeof(GtfAttr));  /* 8 pairs */
+
+    const char *p = raw;
+    while (*p) {
+        while (*p == ' ' || *p == '\t') p++;  /* skip whitespace */
+        if (!*p) break;
+
+        /* extract key */
+        const char *key_start = p;
+        while (*p && *p != ' ' && *p != '\t' && *p != ';') p++;
+        char *key = strndup_safe(key_start, p - key_start);
+
+        while (*p == ' ' || *p == '\t') p++;  /* skip whitespace */
+
+        /* extract value — quoted or bare */
+        if (*p == '"') {
+            p++;  /* skip opening quote */
+            const char *val_start = p;
+            while (*p && *p != '"') p++;
+            value = strndup_safe(val_start, p - val_start);
+            if (*p == '"') p++;  /* skip closing quote */
+        } else { ... }
+
+        /* store the pair, grow array if needed */
+        a->pairs[a->n].key   = key;
+        a->pairs[a->n].value = value;
+        a->n++;
+
+        while (*p && *p != ';') p++;  /* skip to next semicolon */
+        if (*p == ';') p++;
+    }
+    return a;
+}
+```
+
+`p` starts at the beginning of the raw string and advances forward — it
+never moves backward. This is the same pointer-walking style used in
+`attr_get` in `stats.c`, but instead of stopping when one key is found, it
+continues until the entire string has been consumed, producing all pairs.
+
+**`p - key_start` — pointer subtraction.** Both `p` and `key_start` point
+into the same string. Subtracting two pointers of the same type gives the
+number of elements between them — here, the number of characters in the key.
+Pointer subtraction yields a value of type `ptrdiff_t` (a signed integer),
+but `strndup_safe` takes `size_t` (unsigned); the cast is safe because `p`
+is always at or ahead of `key_start`.
+
+**Error paths with partial construction.** If any `malloc` inside the loop
+fails, we have a partially built `GtfAttrs` — some pairs have been stored,
+some have not, and the just-allocated `key` or `value` that triggered the
+failure is dangling. The cleanup order is:
+1. Free the just-allocated string that triggered failure (if any).
+2. Call `gtf_attrs_free(a)` — it iterates over `a->n` already-stored pairs
+   and frees their keys, values, the pairs array, and the struct itself.
+
+This works because `a->n` always reflects only the pairs that have been
+*fully* stored (both key and value set). A pair that failed mid-construction
+has not yet been added to `a->n`, so `gtf_attrs_free` never sees it.
+
+### `gtf_attrs_get` — linear scan
+
+```c
+const char *gtf_attrs_get(const GtfAttrs *a, const char *key)
+{
+    for (size_t i = 0; i < a->n; i++)
+        if (strcmp(a->pairs[i].key, key) == 0)
+            return a->pairs[i].value;
+    return NULL;
+}
+```
+
+A linear scan over the pairs array. A typical GTF record has 5–20 attributes,
+so this is fast in practice. A hash table would give O(1) lookup, but adds
+significant implementation complexity for little practical gain at this scale.
+
+The function returns `const char *` — a read-only pointer to the value
+string owned by the `GtfAttrs`. The caller must not free or modify it, and
+must not use it after calling `gtf_attrs_free`.
+
+### `gtf_attrs_free` — cascading free
+
+```c
+void gtf_attrs_free(GtfAttrs *a)
+{
+    if (!a) return;
+    for (size_t i = 0; i < a->n; i++) {
+        free(a->pairs[i].key);
+        free(a->pairs[i].value);
+    }
+    free(a->pairs);
+    free(a);
+}
+```
+
+The `if (!a) return` guard makes the function safe to call with `NULL`,
+which is the standard convention for free-like functions in C (`free(NULL)`
+is also defined as a no-op). This matters in error paths where `gtf_attrs_parse`
+may return `NULL` — the caller can call `gtf_attrs_free(a)` without
+checking first.
+
+The loop frees the two heap strings inside each pair. After the loop,
+`free(a->pairs)` releases the array of pairs. Finally `free(a)` releases the
+`GtfAttrs` struct itself. Reversing this order — freeing the struct or the
+pairs array before the strings — would not cause a crash immediately, but
+the string allocations would become unreachable: a memory leak.
+
+### Why not embed `GtfAttrs` inside `GtfRecord`?
+
+The simpler design might be to parse attributes automatically in
+`gtf_parse_line` and store the result directly in `GtfRecord`:
+
+```c
+typedef struct {
+    // ... existing fields ...
+    char     attributes[GTF_ATTR_MAX];  /* raw, for printing */
+    GtfAttr *attrs;                     /* parsed, for lookup */
+    size_t   n_attrs;
+} GtfRecord;
+```
+
+This would be convenient for callers — no separate parse step. But it comes
+with a significant cost: `GtfRecord` would no longer be a **value type**.
+
+Currently you can write:
+
+```c
+GtfRecord rec;
+gtf_parse_line(line, &rec);
+// use rec
+// no cleanup needed — rec lives on the stack and disappears automatically
+```
+
+If `GtfRecord` contained a heap-allocated `attrs` array, every `gtf_parse_line`
+call would allocate memory that must eventually be freed. The streaming loops
+in `stats.c` and `compare.c` — which declare a single `GtfRecord rec` and
+reuse it each iteration — would suddenly leak memory on every line. The
+`GtfTable` array would require a cascading free loop over all records, as
+`cmp_free_transcripts` does for `Transcript`.
+
+Keeping `GtfAttrs` separate preserves `GtfRecord`'s value-type semantics.
+Callers that need attribute access parse on demand and free when done.
+Callers that do not (like `stats.c`, which uses its own internal parser)
+pay nothing.
+
+### `cmd_attrs` — tying it together
+
+```c
+static int cmd_attrs(FILE *fp, const char *key)
+{
+    GtfTable *t = gtf_table_load(fp);
+    if (!t) { ... return 1; }
+
+    for (size_t i = 0; i < t->n; i++) {
+        GtfAttrs *a = gtf_attrs_parse(t->recs[i].attributes);
+        if (!a) { gtf_table_free(t); return 1; }
+        const char *val = gtf_attrs_get(a, key);
+        printf("%s\n", val ? val : ".");
+        gtf_attrs_free(a);
+    }
+
+    gtf_table_free(t);
+    return 0;
+}
+```
+
+`GtfAttrs *a` is created, used, and freed inside a single loop iteration.
+It is a **temporary** — its lifetime is shorter than the loop variable `i`.
+This is a useful mental model: when you see `malloc` and `free` bracketing
+a use, the allocation is scoped to that block even if C does not enforce it.
+
+`val ? val : "."` — the ternary chooses between the found value and the
+sentinel string `"."`. Printing `"."` for absent keys (the GTF convention
+for missing fields) means the output has exactly one line per input record,
+making it safe to `paste` with other per-record output or process with `awk`.
+
+`printf("%s\n", val ? val : ".")` — the `%s` format specifier requires a
+non-NULL pointer. If `gtf_attrs_get` returned `NULL` and we printed it
+directly, the behaviour would be undefined (and typically a crash on most
+platforms). The ternary ensures a valid pointer is always passed.

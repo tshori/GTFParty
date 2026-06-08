@@ -11,26 +11,74 @@ static void usage(const char *prog)
     fprintf(stderr, "Usage: %s <command> [args]\n\n", prog);
     fprintf(stderr, "Commands:\n");
     fprintf(stderr, "  print   <file.gtf>              print all records to stdout\n");
+    fprintf(stderr, "  filter  <feature> <file.gtf>    print records matching feature type\n");
+    fprintf(stderr, "  attrs   <key> <file.gtf>        extract one attribute value per record\n");
     fprintf(stderr, "  stats   <file.gtf>              exon/intron statistics\n");
     fprintf(stderr, "  compare <file1.gtf> <file2.gtf> structural comparison by coordinate\n");
 }
 
 static int cmd_print(FILE *fp)
 {
-    char line[65536];
-    GtfRecord rec;
-    int parsed = 0, skipped = 0, errors = 0;
-
-    while (fgets(line, sizeof(line), fp)) {
-        int ret = gtf_parse_line(line, &rec);
-        if (ret == 1) { skipped++; continue; }
-        if (ret == -1) { errors++; continue; }
-        gtf_print(&rec);
-        parsed++;
+    GtfTable *t = gtf_table_load(fp);
+    if (!t) {
+        fprintf(stderr, "error: out of memory\n");
+        return 1;
     }
-    fprintf(stderr, "parsed=%d  skipped=%d  errors=%d\n",
-            parsed, skipped, errors);
-    return errors > 0 ? 1 : 0;
+
+    for (size_t i = 0; i < t->n; i++)
+        gtf_print(&t->recs[i]);
+
+    fprintf(stderr, "parsed=%zu  skipped=%zu  errors=%zu\n",
+            t->n, t->n_skipped, t->n_errors);
+
+    int rc = t->n_errors > 0 ? 1 : 0;
+    gtf_table_free(t);
+    return rc;
+}
+
+static int cmd_attrs(FILE *fp, const char *key)
+{
+    GtfTable *t = gtf_table_load(fp);
+    if (!t) {
+        fprintf(stderr, "error: out of memory\n");
+        return 1;
+    }
+
+    for (size_t i = 0; i < t->n; i++) {
+        GtfAttrs *a = gtf_attrs_parse(t->recs[i].attributes);
+        if (!a) {
+            fprintf(stderr, "error: out of memory\n");
+            gtf_table_free(t);
+            return 1;
+        }
+        const char *val = gtf_attrs_get(a, key);
+        printf("%s\n", val ? val : ".");
+        gtf_attrs_free(a);
+    }
+
+    gtf_table_free(t);
+    return 0;
+}
+
+static int cmd_filter(FILE *fp, const char *feature)
+{
+    GtfTable *t = gtf_table_load(fp);
+    if (!t) {
+        fprintf(stderr, "error: out of memory\n");
+        return 1;
+    }
+
+    size_t matched = 0;
+    for (size_t i = 0; i < t->n; i++) {
+        if (strcmp(t->recs[i].feature, feature) == 0) {
+            gtf_print(&t->recs[i]);
+            matched++;
+        }
+    }
+
+    fprintf(stderr, "matched=%zu  total=%zu\n", matched, t->n);
+    gtf_table_free(t);
+    return 0;
 }
 
 static int cmd_stats(FILE *fp)
@@ -99,6 +147,24 @@ int main(int argc, char *argv[])
             return 1;
         }
         return cmd_compare(argv[2], argv[3]);
+    }
+
+    /* filter and attrs both take one string arg then a file */
+    if (strcmp(cmd, "filter") == 0 || strcmp(cmd, "attrs") == 0) {
+        if (argc < 4) {
+            if (strcmp(cmd, "filter") == 0)
+                fprintf(stderr, "Usage: %s filter <feature> <file.gtf>\n", argv[0]);
+            else
+                fprintf(stderr, "Usage: %s attrs <key> <file.gtf>\n", argv[0]);
+            return 1;
+        }
+        FILE *fp = fopen(argv[3], "r");
+        if (!fp) { perror(argv[3]); return 1; }
+        int rc = (strcmp(cmd, "filter") == 0)
+                 ? cmd_filter(fp, argv[2])
+                 : cmd_attrs(fp, argv[2]);
+        fclose(fp);
+        return rc;
     }
 
     /* all other commands take one file argument */

@@ -8,6 +8,8 @@ files, built step by step as a C learning project.
 | Tool                  | Language | Description |
 |-----------------------|----------|-------------|
 | `gtfparse print`      | C        | Parse a GTF file and print it back out (round-trip validator) |
+| `gtfparse filter`     | C        | Print only records matching a given feature type |
+| `gtfparse attrs`      | C        | Extract one attribute value per record |
 | `gtfparse stats`      | C        | Exon and intron statistics: counts, per-gene averages, single-exon rates |
 | `gtfparse compare`    | C        | Structural comparison of two GTFs by genomic coordinate and intron chain |
 | `compare_gtf.py`      | Python   | Compare two GTFs by gene/transcript ID; write filtered or merged output; Venn diagram |
@@ -47,6 +49,33 @@ diff <(grep -v '^#' file.gtf) out.gtf
 
 # Count records by feature type
 ./gtfparse print file.gtf | awk '{print $3}' | sort | uniq -c | sort -rn
+```
+
+### filter
+
+Prints all records whose feature column matches the given type.
+Diagnostic counts (matched / total) go to stderr.
+
+```sh
+./gtfparse filter exon file.gtf
+./gtfparse filter CDS  file.gtf
+./gtfparse filter gene file.gtf > genes.gtf
+```
+
+### attrs
+
+Parses the attributes column of every record and prints the value of the
+requested key, one line per record.  Prints `.` when the key is absent.
+
+```sh
+# List all unique gene IDs
+./gtfparse attrs gene_id file.gtf | sort -u
+
+# Extract transcript IDs from exon records only
+./gtfparse filter exon file.gtf | ./gtfparse attrs transcript_id /dev/stdin
+
+# Count records per gene
+./gtfparse attrs gene_id file.gtf | sort | uniq -c | sort -rn | head
 ```
 
 ### stats
@@ -157,8 +186,8 @@ Output modes:
 
 ```
 .
-├── gtf.h            # GtfRecord struct and function declarations
-├── gtf.c            # Parser and printer implementation
+├── gtf.h            # GtfRecord, GtfTable, GtfAttrs structs and declarations
+├── gtf.c            # Parser, printer, dynamic record table, attribute parsing
 ├── stats.h          # GtfExonIntronStats struct and function declarations
 ├── stats.c          # Exon/intron statistics implementation
 ├── compare.h        # Transcript struct, CmpStats, function declarations
@@ -182,9 +211,9 @@ Output modes:
    exon/intron stats (heap allocation, `qsort`, attribute parsing);
    ID-based GTF comparison with Venn diagram (`compare_gtf.py`);
    coordinate-based structural comparison (sweep line, intron chain matching)
-2. **Step 2** — Dynamic array of all records (heap allocation for the full record set)
-3. **Step 3** — Filter by feature type
-4. **Step 4** — Parse the attributes column into key/value pairs
+2. **Step 2** ✓ — Dynamic array of all records (`GtfTable`: heap-allocated, doubling-growth array; `gtf_table_load` / `gtf_table_free`)
+3. **Step 3** ✓ — Filter by feature type (`gtfparse filter <feature> <file.gtf>`)
+4. **Step 4** ✓ — Parse the attributes column into key/value pairs (`GtfAttr`/`GtfAttrs`; `gtf_attrs_parse` / `gtf_attrs_get` / `gtf_attrs_free`)
 5. **Step 5** — Sort records by position
 6. **Step 6** — GFF3 support
 7. **Step 7** — Interval overlap query

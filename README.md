@@ -12,6 +12,9 @@ files, built step by step as a C learning project.
 | `gtfparse attrs`      | C        | Extract one attribute value per record (GTF and GFF3) |
 | `gtfparse overlap`    | C        | Find all records overlapping a genomic region |
 | `gtfparse bed`        | C        | Convert GTF/GFF3 to BED6 (0-based half-open coordinates) |
+| `gtfparse sort`       | C        | Sort records by (seqname, start, end) |
+| `gtfparse keys`       | C        | List all unique attribute keys in a file |
+| `gtfparse validate`   | C        | Check coordinate sanity, strand, frame, and required attributes |
 | `gtfparse stats`      | C        | Exon and intron statistics: counts, per-gene averages, single-exon rates |
 | `gtfparse compare`    | C        | Structural comparison of two GTFs by genomic coordinate and intron chain |
 | `compare_gtf.py`      | Python   | Compare two GTFs by gene/transcript ID; write filtered or merged output; Venn diagram |
@@ -186,6 +189,91 @@ bedtools sort -i genes.bed | head
 Coordinate conversion example: a GTF record `chr1 . gene 1001 2000` becomes
 BED `chr1 1000 2000 . 0 .`.
 
+### sort
+
+Sorts all records by `(seqname, start, end)` and writes them back out in the
+original format.  The sort order is lexicographic on seqname, then numeric on
+start and end.
+
+Sorting is required before `overlap` queries, and is useful any time
+downstream tools expect a canonical record order.  Diagnostic counts go to
+stderr; sorted records go to stdout.
+
+```sh
+./gtfparse sort file.gtf > sorted.gtf
+./gtfparse sort file.gff3 -o sorted.gff3
+
+# Sort then query — overlap sorts internally, but explicit sort lets you
+# inspect the sorted file or feed it to other tools
+./gtfparse sort file.gtf | ./gtfparse overlap chr1:1000-5000 /dev/stdin
+```
+
+### keys
+
+Scans every record in a file, parses the attributes column, and prints all
+unique attribute key names — one per line, sorted alphabetically.  Works with
+both GTF (`key "value";`) and GFF3 (`key=value;`).
+
+Useful for discovering what metadata is available before querying with `attrs`,
+or for auditing two annotation files to see if they share the same attribute
+vocabulary.
+
+```sh
+./gtfparse keys file.gtf
+./gtfparse keys file.gff3
+
+# Compare attribute keys between two files
+diff <(./gtfparse keys file1.gtf 2>/dev/null) <(./gtfparse keys file2.gtf 2>/dev/null)
+
+# Save key list to a file
+./gtfparse keys file.gtf -o keys.txt
+```
+
+### validate
+
+Checks every record for common errors and prints each violation to stdout,
+one per line.  Exits with code `0` if no errors are found, `1` otherwise —
+making it usable directly in shell scripts.
+
+**Checks performed:**
+
+| Check | What is tested |
+|-------|---------------|
+| `coord` | `start >= 1`; `end >= start` |
+| `strand` | value is `+`, `-`, or `.` |
+| `frame` | CDS / start_codon / stop_codon must have a numeric frame (0, 1, 2) |
+| `attr` (GTF) | every record has `gene_id`; exon/CDS/codon features also have `transcript_id` |
+| `attr` (GFF3) | gene/mRNA/transcript features have `ID`; mRNA/exon/CDS features have `Parent` |
+
+Format (GTF vs GFF3) is detected automatically.  Violations go to stdout so
+they can be saved with `-o` or piped; the summary line goes to stderr.
+
+```sh
+./gtfparse validate file.gtf
+./gtfparse validate file.gff3
+
+# Save violations to a file, still see summary on terminal
+./gtfparse validate file.gtf -o errors.txt
+
+# Use exit code in a script
+if ./gtfparse validate file.gtf > /dev/null 2>&1; then
+    echo "file is valid"
+else
+    echo "validation failed"
+fi
+
+# Count violations by check type
+./gtfparse validate file.gtf 2>/dev/null | awk -F': ' '{print $2}' | sort | uniq -c
+```
+
+Example output for a file with problems:
+```
+record 3: coord: start (0) must be >= 1
+record 7: strand: invalid value 'q'
+record 12: frame: feature 'CDS' requires a frame (0, 1, or 2)
+record 41: attr: missing required attribute 'gene_id'
+```
+
 ### stats
 
 Reads all `exon` features and computes:
@@ -326,3 +414,6 @@ Output modes:
 6. **Step 6** ✓ — GFF3 support (`gff3_attrs_parse`; auto-detect via `##gff-version`; stop at `##FASTA`)
 7. **Step 7** ✓ — Interval overlap query (`gtf_table_query`: binary search to seqname block + forward scan; `gtfparse overlap seqname:start-end`)
 8. **Step 8** ✓ — BED6 export (`gtfparse bed [--name attr]`: GTF→BED coordinate conversion, optional attribute-based name extraction)
+9. **Step 9** ✓ — Sort command (`gtfparse sort`: expose `gtf_table_sort` as a user-facing command; library/command separation)
+10. **Step 10** ✓ — Attribute key discovery (`gtfparse keys`: dynamic string array, deduplication by linear scan, `qsort` on `char **`, `goto` for OOM cleanup)
+11. **Step 11** ✓ — Validation (`gtfparse validate`: per-record checks, NULL-terminated feature sets, meaningful exit codes)

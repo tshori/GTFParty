@@ -28,6 +28,9 @@ Written alongside the code as a learning companion.
 19. [Hash table — O(1) seqname lookup](#19-hash-table--o1-seqname-lookup)
 20. [BED output — coordinate conversion and format interop](#20-bed-output--coordinate-conversion-and-format-interop)
 21. [Output redirection — argv compaction and freopen](#21-output-redirection--argv-compaction-and-freopen)
+22. [sort — exposing library code as a command](#22-sort--exposing-library-code-as-a-command)
+23. [keys — dynamic string deduplication and goto](#23-keys--dynamic-string-deduplication-and-goto)
+24. [validate — per-record checks, feature sets, and exit codes](#24-validate--per-record-checks-feature-sets-and-exit-codes)
 
 ---
 
@@ -3140,3 +3143,291 @@ The Unix convention of separating data (stdout) from diagnostics (stderr)
 is what makes this work cleanly.  It is also why piping works: in
 `cmd1 | cmd2`, the shell connects cmd1's stdout to cmd2's stdin while both
 commands' stderrs remain on the terminal.
+
+---
+
+## §22 sort — exposing library code as a command
+
+### The function
+
+```c
+static int cmd_sort(FILE *fp)
+{
+    GtfTable *t = gtf_table_load(fp);
+    if (!t) { fprintf(stderr, "error: out of memory\n"); return 1; }
+
+    fprintf(stderr, "  sorting %zu records...\n", t->n);
+    gtf_table_sort(t);
+
+    for (size_t i = 0; i < t->n; i++)
+        gtf_print(&t->recs[i]);
+
+    fprintf(stderr, "records=%zu  format=%s\n", t->n,
+            t->format == GTF_FMT_GFF3 ? "gff3" : "gtf");
+    gtf_table_free(t);
+    return 0;
+}
+```
+
+This is the shortest `cmd_*` function in the codebase.  It calls
+`gtf_table_sort` (§15), which already exists and is already used internally
+by `overlap` and `merge`.  The only new work is the loop that calls
+`gtf_print` for every record after sorting.
+
+### Library code vs command code
+
+The codebase has two layers:
+
+- **Library layer** (`gtf.c`): functions that manipulate data — `gtf_table_load`,
+  `gtf_table_sort`, `gtf_table_query`, `gtf_attrs_parse`, etc.  These know
+  nothing about command-line arguments, flags, or what the user typed.
+- **Command layer** (`main.c`): functions that parse arguments, open files,
+  call library functions, and format output for the user.
+
+`gtf_table_sort` existed before `sort` was a user command because `overlap`
+needed it internally.  Adding the `sort` command required zero changes to the
+library layer.  This is the payoff of keeping the two layers separate: library
+functions accumulate value over time and can be reused in ways not anticipated
+when they were written.
+
+The same principle applies in larger systems.  A database engine's sort
+routine can be exposed as `ORDER BY` in SQL, as a sort utility in the CLI,
+and called internally by join algorithms — all without modifying the sort
+routine itself.
+
+### Why sort is useful as a command
+
+**Reproducibility.**  GTF files from different sources, or produced by
+different runs of the same tool, may have records in different orders.
+Sorting normalises the order so that `diff` and checksum-based comparisons
+work correctly.
+
+**Interoperability.**  Tools like `bedtools` require sorted input.
+`./gtfparse sort file.gtf | bedtools ...` feeds pre-sorted data to bedtools
+without a separate sort step.
+
+**Inspection.**  It is easier to read a large annotation file when all records
+for a chromosome appear together and in coordinate order.
+
+**Prerequisite visibility.**  `overlap` sorts internally before querying.
+The explicit `sort` command lets users perform that step once, save the result,
+and run multiple queries against the sorted file without re-sorting each time.
+
+### The sort key
+
+`gtf_table_sort` calls `qsort` with `rec_cmp`, which compares:
+
+1. `seqname` — lexicographic (`strcmp`)
+2. `start` — numeric (ascending)
+3. `end` — numeric (ascending)
+
+`seqname` comparison is lexicographic, which means `chr10` sorts before
+`chr2` (because `'1' < '2'`).  This is the same behaviour as standard Unix
+`sort` without `-V`.  Natural sort (`chr1, chr2, ..., chr10`) would require
+a custom comparator that splits the string into text and numeric segments —
+a more complex function, and one we have not needed yet.
+
+---
+
+## §23 keys — dynamic string deduplication and goto
+
+### What the command does
+
+`keys` answers the question: *what attribute keys exist anywhere in this
+file?*  It parses every record's attributes column, collects unique key
+names into a dynamic array, sorts them, and prints one per line.
+
+### The key array
+
+The unique keys are stored in a local `char **keys` dynamic array — the same
+doubling-growth pattern used by `GtfTable` and `StrPool`, but local to
+`cmd_keys` rather than in a named struct:
+
+```c
+char  **keys = NULL;
+size_t  nk = 0, capk = 0;
+```
+
+`keys` starts as `NULL`.  The first time a new key is found, `realloc` grows
+it to 16 slots; subsequent growth doubles the capacity.  Each entry is a
+heap-allocated copy of the key string.
+
+**Why copy?**  The key string lives inside a `GtfAttrs` struct which is freed
+at the end of each record's iteration.  A pointer into a freed allocation is a
+dangling pointer.  Copying with `malloc + strcpy` gives the key array its own
+stable storage that outlives the per-record loop.
+
+### Deduplication by linear scan
+
+Before inserting a new key, the code scans every existing entry:
+
+```c
+int found = 0;
+for (size_t m = 0; m < nk; m++)
+    if (strcmp(keys[m], k) == 0) { found = 1; break; }
+if (found) continue;
+```
+
+This is O(u) per candidate key, where u is the number of unique keys already
+seen.  For the common case — GTF files have roughly 5–25 distinct attribute
+keys — this is negligible compared to the O(n) cost of loading 1.7 million
+records.  Replacing the linear scan with a hash table would be an
+over-engineering for this problem size.
+
+The choice between linear scan and hash table is a question of expected input
+size.  When u is bounded and small, a linear scan is simpler, has lower
+constant factors, and uses less memory.  The hash table in `gtf_table_sort`
+is justified because n (number of chromosomes) can reach thousands; u here
+is bounded by the format specification itself.
+
+### goto for error cleanup
+
+When a `malloc` or `realloc` fails mid-loop, the code needs to free everything
+already allocated and return an error.  Without `goto`, this requires either
+deeply nested `if`s or duplicating the cleanup code on every error path.
+
+The `goto done` pattern consolidates all cleanup in one place:
+
+```c
+    if (!tmp) { gtf_attrs_free(a); rc = 1; goto done; }
+    ...
+    if (!copy) { gtf_attrs_free(a); rc = 1; goto done; }
+
+done:
+    if (rc) fprintf(stderr, "error: out of memory\n");
+
+    for (size_t i = 0; i < nk; i++) free(keys[i]);
+    free(keys);
+    gtf_table_free(t);
+    return rc;
+```
+
+The label `done:` is placed just before the cleanup block.  Every error path
+sets `rc = 1` and jumps there; the normal path falls through to `done:`
+naturally after the loop ends.  The cleanup runs unconditionally in both cases.
+
+`goto` has a bad reputation from its misuse in early languages, but in C it
+is the idiomatic way to handle multi-step cleanup on error.  The Linux kernel
+uses this pattern in nearly every function that allocates more than one
+resource.  The rule is: `goto` only jumps *forward*, never backward, and the
+label is always near the end of the function.
+
+### Sorting char ** with qsort
+
+After collecting all unique keys, they are sorted with:
+
+```c
+qsort(keys, nk, sizeof(char *), cmp_str_ptr);
+```
+
+The comparator receives two `const void *` pointers, each pointing to one
+element of the `char **` array — so each is a `char **`:
+
+```c
+static int cmp_str_ptr(const void *a, const void *b)
+{
+    return strcmp(*(const char **)a, *(const char **)b);
+}
+```
+
+The double dereference `*(const char **)a` casts `a` from `void *` to
+`char **`, then dereferences to get the `char *` string pointer.  This is the
+standard pattern for sorting any array of pointers with `qsort` — the
+comparator always receives a pointer *to the element*, not the element itself.
+
+---
+
+## §24 validate — per-record checks, feature sets, and exit codes
+
+### What the command checks
+
+Each record is tested against four independent groups of rules:
+
+| Group | Condition checked |
+|-------|------------------|
+| `coord` | `start >= 1`; `end >= start` |
+| `strand` | value is `+`, `-`, or `.` |
+| `frame` | CDS / start_codon / stop_codon must have frame 0, 1, or 2 |
+| `attr` | presence of required attribute keys (format-dependent) |
+
+Each violation is printed to stdout immediately when found, with the record
+number and check group name.  After all records are scanned, a summary line
+goes to stderr.
+
+### NULL-terminated feature sets
+
+Several checks need to test whether the current record's feature belongs to
+a predefined set.  Rather than a chain of `||` comparisons, the code uses
+`NULL`-terminated `const char *` arrays and a small helper:
+
+```c
+static const char *const cds_like[] = { "CDS", "start_codon", "stop_codon", NULL };
+
+static int feat_in(const char *feat, const char *const *set)
+{
+    for (; *set; set++)
+        if (strcmp(feat, *set) == 0) return 1;
+    return 0;
+}
+```
+
+`static const char *const cds_like[]` — there are two layers of `const`:
+- `const char *` — the string each pointer points to is read-only
+- `const *` at the array level — the pointers themselves are read-only
+
+`static` on the array means it lives in static storage (once, for the
+lifetime of the program) rather than being rebuilt on the stack each time
+the function is called.  Because the array never changes, this is the right
+storage class.
+
+The sentinel `NULL` at the end lets `feat_in` walk the array without needing
+to know its length — a classic C idiom used by `argv`, `execv`, and many
+library APIs.
+
+### Why check frame only for CDS-like features
+
+The GTF/GFF3 frame field specifies how many bases at the start of the feature
+need to be skipped to reach the first complete codon.  It is only meaningful
+for features that encode protein: `CDS`, `start_codon`, `stop_codon`.  For
+`gene`, `exon`, and other non-coding features the field is conventionally `.`
+(stored as `-1`), so checking frame == -1 on those would produce false
+positives.
+
+### Exit code as a signal
+
+The function returns `nerrors > 0 ? 1 : 0`:
+
+```c
+return nerrors > 0 ? 1 : 0;
+```
+
+Returning a non-zero exit code when errors are found is the Unix convention
+for tools that make a pass/fail determination (`diff`, `test`, `grep`).  It
+lets the validator be used directly in shell scripts without parsing stdout:
+
+```sh
+if ./gtfparse validate annotation.gtf > /dev/null 2>&1; then
+    echo "clean — proceeding with pipeline"
+fi
+```
+
+This is distinct from returning an error code to signal a *program* failure
+(like `malloc` returning `NULL`).  The distinction matters: exit code 1 here
+means "the file has problems", not "the program crashed".
+
+### What this validator does not check
+
+Per-record checks catch individual malformed records but cannot detect
+cross-record inconsistencies.  A complete validator would also check:
+
+- Every `transcript_id` referenced by an exon must have a corresponding
+  transcript record.
+- Exons within a transcript must not overlap each other.
+- CDS intervals must be contained within exon intervals.
+- `Parent=` values in GFF3 must resolve to a record with a matching `ID=`.
+
+These require grouping records by ID and comparing intervals across the
+group — a hash-table-of-record-lists problem.  The current implementation
+deliberately stops before that complexity; those checks are the natural next
+step and a good exercise in combining the `HTable` (§19) with dynamic arrays
+(§11).

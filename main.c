@@ -19,6 +19,9 @@ static void usage(const char *prog)
     fprintf(stderr, "  attrs   <key> <file>             extract one attribute value per record\n");
     fprintf(stderr, "  overlap <seqname:start-end> <file>  records overlapping a region\n");
     fprintf(stderr, "  bed     [--name <attr>] <file>   BED6 output (0-based half-open coords)\n");
+    fprintf(stderr, "  sort    <file>                   sort records by (seqname, start, end)\n");
+    fprintf(stderr, "  keys    <file>                   list all unique attribute keys\n");
+    fprintf(stderr, "  validate <file>                  check coordinates, strand, frame, required attributes\n");
     fprintf(stderr, "  stats   <file.gtf>               exon/intron statistics (GTF only)\n");
     fprintf(stderr, "  compare <file1> <file2>          structural comparison (GTF only)\n");
 }
@@ -266,6 +269,175 @@ static int cmd_filter(FILE *fp, const char *feature)
     return 0;
 }
 
+static int cmd_sort(FILE *fp)
+{
+    GtfTable *t = gtf_table_load(fp);
+    if (!t) { fprintf(stderr, "error: out of memory\n"); return 1; }
+
+    fprintf(stderr, "  sorting %zu records...\n", t->n);
+    gtf_table_sort(t);
+
+    for (size_t i = 0; i < t->n; i++)
+        gtf_print(&t->recs[i]);
+
+    fprintf(stderr, "records=%zu  format=%s\n", t->n,
+            t->format == GTF_FMT_GFF3 ? "gff3" : "gtf");
+    gtf_table_free(t);
+    return 0;
+}
+
+/* Returns 1 if feature matches any name in a NULL-terminated list. */
+static int feat_in(const char *feat, const char *const *set)
+{
+    for (; *set; set++)
+        if (strcmp(feat, *set) == 0) return 1;
+    return 0;
+}
+
+static int cmd_validate(FILE *fp)
+{
+    GtfTable *t = gtf_table_load(fp);
+    if (!t) { fprintf(stderr, "error: out of memory\n"); return 1; }
+
+    /* Feature sets used in attribute checks */
+    static const char *const cds_like[]   = { "CDS", "start_codon", "stop_codon", NULL };
+    static const char *const need_txid[]  = { "exon", "CDS", "start_codon", "stop_codon",
+                                               "UTR", "five_prime_UTR", "three_prime_UTR", NULL };
+    static const char *const need_id[]    = { "gene", "mRNA", "transcript", NULL };
+    static const char *const need_parent[]= { "mRNA", "transcript", "exon", "CDS",
+                                               "UTR", "five_prime_UTR", "three_prime_UTR", NULL };
+
+    size_t nerrors = 0;
+
+    for (size_t i = 0; i < t->n; i++) {
+        const GtfRecord *r = &t->recs[i];
+        size_t rec = i + 1;   /* 1-based record number for output */
+
+        /* --- coordinate sanity --- */
+        if (r->start < 1) {
+            printf("record %zu: coord: start (%ld) must be >= 1\n", rec, r->start);
+            nerrors++;
+        }
+        if (r->end < r->start) {
+            printf("record %zu: coord: end (%ld) < start (%ld)\n", rec, r->end, r->start);
+            nerrors++;
+        }
+
+        /* --- strand --- */
+        if (r->strand != '+' && r->strand != '-' && r->strand != '.') {
+            printf("record %zu: strand: invalid value '%c'\n", rec, r->strand);
+            nerrors++;
+        }
+
+        /* --- frame: CDS-like features require 0, 1, or 2 --- */
+        if (feat_in(r->feature, cds_like) && r->frame == -1) {
+            printf("record %zu: frame: feature '%s' requires a frame (0, 1, or 2)\n",
+                   rec, r->feature);
+            nerrors++;
+        }
+
+        /* --- required attributes --- */
+        GtfAttrs *a = (t->format == GTF_FMT_GFF3)
+                      ? gff3_attrs_parse(r->attributes)
+                      : gtf_attrs_parse(r->attributes);
+        if (!a) { fprintf(stderr, "error: out of memory\n"); gtf_table_free(t); return 1; }
+
+        if (t->format == GTF_FMT_GTF) {
+            if (!gtf_attrs_get(a, "gene_id")) {
+                printf("record %zu: attr: missing required attribute 'gene_id'\n", rec);
+                nerrors++;
+            }
+            if (feat_in(r->feature, need_txid) && !gtf_attrs_get(a, "transcript_id")) {
+                printf("record %zu: attr: feature '%s' missing required attribute 'transcript_id'\n",
+                       rec, r->feature);
+                nerrors++;
+            }
+        } else {
+            if (feat_in(r->feature, need_id) && !gtf_attrs_get(a, "ID")) {
+                printf("record %zu: attr: feature '%s' missing required attribute 'ID'\n",
+                       rec, r->feature);
+                nerrors++;
+            }
+            if (feat_in(r->feature, need_parent) && !gtf_attrs_get(a, "Parent")) {
+                printf("record %zu: attr: feature '%s' missing required attribute 'Parent'\n",
+                       rec, r->feature);
+                nerrors++;
+            }
+        }
+        gtf_attrs_free(a);
+    }
+
+    fprintf(stderr, "checked=%zu  errors=%zu  format=%s\n", t->n, nerrors,
+            t->format == GTF_FMT_GFF3 ? "gff3" : "gtf");
+    gtf_table_free(t);
+    /* exit 1 if errors found — useful in scripts: if ./gtfparse validate f.gtf; then ... */
+    return nerrors > 0 ? 1 : 0;
+}
+
+static int cmp_str_ptr(const void *a, const void *b)
+{
+    return strcmp(*(const char **)a, *(const char **)b);
+}
+
+static int cmd_keys(FILE *fp)
+{
+    GtfTable *t = gtf_table_load(fp);
+    if (!t) { fprintf(stderr, "error: out of memory\n"); return 1; }
+
+    char  **keys = NULL;
+    size_t  nk = 0, capk = 0;
+    int     rc = 0;
+
+    for (size_t i = 0; i < t->n; i++) {
+        GtfAttrs *a = (t->format == GTF_FMT_GFF3)
+                      ? gff3_attrs_parse(t->recs[i].attributes)
+                      : gtf_attrs_parse(t->recs[i].attributes);
+        if (!a) { rc = 1; break; }
+
+        for (size_t j = 0; j < a->n; j++) {
+            const char *k = a->pairs[j].key;
+
+            /* linear scan — unique key count is small (typically < 30) */
+            int found = 0;
+            for (size_t m = 0; m < nk; m++)
+                if (strcmp(keys[m], k) == 0) { found = 1; break; }
+            if (found) continue;
+
+            /* grow array */
+            if (nk >= capk) {
+                size_t newcap = capk ? capk * 2 : 16;
+                char **tmp = realloc(keys, newcap * sizeof(char *));
+                if (!tmp) { gtf_attrs_free(a); rc = 1; goto done; }
+                keys = tmp;
+                capk = newcap;
+            }
+
+            /* copy the key — it lives inside 'a' which is freed each iteration */
+            char *copy = malloc(strlen(k) + 1);
+            if (!copy) { gtf_attrs_free(a); rc = 1; goto done; }
+            strcpy(copy, k);
+            keys[nk++] = copy;
+        }
+        gtf_attrs_free(a);
+    }
+
+done:
+    if (rc) {
+        fprintf(stderr, "error: out of memory\n");
+    } else {
+        qsort(keys, nk, sizeof(char *), cmp_str_ptr);
+        for (size_t i = 0; i < nk; i++)
+            printf("%s\n", keys[i]);
+        fprintf(stderr, "unique_keys=%zu  records=%zu  format=%s\n", nk, t->n,
+                t->format == GTF_FMT_GFF3 ? "gff3" : "gtf");
+    }
+
+    for (size_t i = 0; i < nk; i++) free(keys[i]);
+    free(keys);
+    gtf_table_free(t);
+    return rc;
+}
+
 static int cmd_stats(FILE *fp)
 {
     GtfExonIntronStats stats;
@@ -470,6 +642,12 @@ int main(int argc, char *argv[])
     int ret;
     if (strcmp(cmd, "stats") == 0)
         ret = cmd_stats(fp);
+    else if (strcmp(cmd, "sort") == 0)
+        ret = cmd_sort(fp);
+    else if (strcmp(cmd, "keys") == 0)
+        ret = cmd_keys(fp);
+    else if (strcmp(cmd, "validate") == 0)
+        ret = cmd_validate(fp);
     else {
         fprintf(stderr, "unknown command: %s\n\n", cmd);
         usage(argv[0]);

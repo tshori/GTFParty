@@ -1,0 +1,9 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(./gtfparse keys *)",
+      "Bash(./gtfparse print *)",
+      "Bash(awk 'NR<=3{print}')"
+    ]
+  }
+}

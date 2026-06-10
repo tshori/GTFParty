@@ -75,7 +75,7 @@ int gtf_exon_intron_stats(FILE *fp, GtfExonIntronStats *stats)
     size_t n_rows = 0;
 
     char line[65536];
-    GtfRecord rec;
+    GtfRawRecord rec;
 
     while (fgets(line, sizeof(line), fp)) {
         if (gtf_parse_line(line, &rec) != 0) continue;

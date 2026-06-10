@@ -11,6 +11,7 @@ files, built step by step as a C learning project.
 | `gtfparse filter`     | C        | Print only records matching a given feature type |
 | `gtfparse attrs`      | C        | Extract one attribute value per record (GTF and GFF3) |
 | `gtfparse overlap`    | C        | Find all records overlapping a genomic region |
+| `gtfparse bed`        | C        | Convert GTF/GFF3 to BED6 (0-based half-open coordinates) |
 | `gtfparse stats`      | C        | Exon and intron statistics: counts, per-gene averages, single-exon rates |
 | `gtfparse compare`    | C        | Structural comparison of two GTFs by genomic coordinate and intron chain |
 | `compare_gtf.py`      | Python   | Compare two GTFs by gene/transcript ID; write filtered or merged output; Venn diagram |
@@ -33,18 +34,60 @@ pip install matplotlib matplotlib-venn
 ## Usage
 
 ```sh
-./gtfparse <command> [file.gtf ...]
+./gtfparse <command> [args] [-o <file>]
+```
+
+### Global flags
+
+| Flag | Short | Effect |
+|------|-------|--------|
+| `--output <file>` | `-o <file>` | Write output to `<file>` instead of stdout |
+
+The `-o` flag works with every command and can appear anywhere in the argument list.
+Diagnostic messages always go to stderr regardless of `-o`, so progress and
+summary lines remain visible on the terminal while output goes to the file.
+
+```sh
+# Equivalent to shell redirection, but built in
+./gtfparse filter gene file.gtf -o genes.gtf
+./gtfparse bed --name gene_id file.gtf -o genes.bed
+./gtfparse print --chrom chr1 -o chr1.gtf file.gtf
+
+# --output=<file> form also accepted
+./gtfparse filter exon file.gtf --output=exons.gtf
 ```
 
 ### print
 
 Parses every record and writes it back to stdout.
 Accepts both GTF and GFF3 — format is detected automatically from the
-`##gff-version 3` pragma.  Diagnostic counts go to stderr.
+`##gff-version 3` pragma.  Diagnostic counts (including a `printed=` tally)
+go to stderr.  Loading progress is printed to stderr every 100,000 records.
+
+Optional flags narrow output to one or more chromosomes or sources:
+
+| Flag | Value | Effect |
+|------|-------|--------|
+| `--chrom` | comma-separated seqnames | keep only records on these chromosomes |
+| `--source` | comma-separated source names | keep only records from these sources |
+
+Both flags can be combined (AND logic: record must pass both).
 
 ```sh
 ./gtfparse print file.gtf
 ./gtfparse print file.gff3
+
+# Single chromosome
+./gtfparse print --chrom chr1 file.gtf
+
+# Multiple chromosomes
+./gtfparse print --chrom chr1,chr2,chrX file.gtf > subset.gtf
+
+# Filter by source/origin
+./gtfparse print --source RefSeq file.gtf
+
+# Combine: chrX records from Gnomon only
+./gtfparse print --chrom chrX --source Gnomon file.gtf
 
 # Round-trip test — diff should be empty
 ./gtfparse print file.gtf > out.gtf
@@ -108,6 +151,40 @@ returned as a single value; splitting is left to the caller.
 **Note on `stats` and `compare`:** these commands look for `gene_id` and
 `transcript_id` attributes in GTF format and will not produce meaningful
 results on GFF3 files.
+
+### bed
+
+Converts every record to BED6 format using 0-based half-open coordinates
+(the standard expected by bedtools, IGV, and other genome tools).
+
+| Column | Value |
+|--------|-------|
+| chrom  | seqname as-is |
+| start  | GTF `start − 1` (0-based) |
+| end    | GTF `end` (unchanged; now exclusive) |
+| name   | value of `--name` attribute, or `.` |
+| score  | GTF score (0–1000, integer), or `0` when `.` in file |
+| strand | `+`, `-`, or `.` |
+
+```sh
+# BED6 with no name column
+./gtfparse bed file.gtf > file.bed
+
+# Use gene_id as the name (GTF)
+./gtfparse bed --name gene_id file.gtf > genes.bed
+
+# Use ID as the name (GFF3)
+./gtfparse bed --name ID file.gff3 > features.bed
+
+# Gene records only, named by gene_id — common pipeline step
+./gtfparse filter gene file.gtf | ./gtfparse bed --name gene_id /dev/stdin > genes.bed
+
+# Check with bedtools
+bedtools sort -i genes.bed | head
+```
+
+Coordinate conversion example: a GTF record `chr1 . gene 1001 2000` becomes
+BED `chr1 1000 2000 . 0 .`.
 
 ### stats
 
@@ -248,3 +325,4 @@ Output modes:
 5. **Step 5** ✓ — Sort records by position (`gtf_table_sort`: in-place `qsort` by seqname/start/end)
 6. **Step 6** ✓ — GFF3 support (`gff3_attrs_parse`; auto-detect via `##gff-version`; stop at `##FASTA`)
 7. **Step 7** ✓ — Interval overlap query (`gtf_table_query`: binary search to seqname block + forward scan; `gtfparse overlap seqname:start-end`)
+8. **Step 8** ✓ — BED6 export (`gtfparse bed [--name attr]`: GTF→BED coordinate conversion, optional attribute-based name extraction)

@@ -139,7 +139,7 @@ Transcript *cmp_build_transcripts(FILE *fp, int src, size_t *out_n)
     if (!exons) return NULL;
 
     char line[65536];
-    GtfRecord rec;
+    GtfRawRecord rec;
 
     while (fgets(line, sizeof(line), fp)) {
         if (gtf_parse_line(line, &rec) != 0) continue;

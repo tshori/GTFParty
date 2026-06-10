@@ -23,6 +23,11 @@ Written alongside the code as a learning companion.
 14. [GFF3 support — a second file format](#14-gff3-support--a-second-file-format)
 15. [gtf_table_sort — sorting records by position](#15-gtf_table_sort--sorting-records-by-position)
 16. [gtf_table_query — interval overlap queries](#16-gtf_table_query--interval-overlap-queries)
+17. [Interval merge — a scan on sorted data](#17-interval-merge--a-scan-on-sorted-data)
+18. [String interning — one allocation per unique string](#18-string-interning--one-allocation-per-unique-string)
+19. [Hash table — O(1) seqname lookup](#19-hash-table--o1-seqname-lookup)
+20. [BED output — coordinate conversion and format interop](#20-bed-output--coordinate-conversion-and-format-interop)
+21. [Output redirection — argv compaction and freopen](#21-output-redirection--argv-compaction-and-freopen)
 
 ---
 
@@ -191,36 +196,59 @@ have no type, no address, and consume no memory. The advantage over raw
 numbers ("magic numbers") is that you can change the buffer size in one
 place and all uses update automatically.
 
-### The struct
+### Two record types
+
+The header defines two related structs — one for parsing, one for storage.
+
+**`GtfRawRecord`** is the scratch buffer filled by `gtf_parse_line`. It uses
+fixed-size character arrays and lives on the stack for one loop iteration:
 
 ```c
 typedef struct {
-    char  seqname[GTF_FIELD_MAX];
-    char  source[GTF_FIELD_MAX];
-    char  feature[GTF_FIELD_MAX];
+    char  seqname[GTF_FIELD_MAX];   /* 256 bytes */
+    char  source[GTF_FIELD_MAX];    /* 256 bytes */
+    char  feature[GTF_FIELD_MAX];   /* 256 bytes */
     long  start;
     long  end;
     float score;
     char  strand;
     int   frame;
-    char  attributes[GTF_ATTR_MAX];
+    char  attributes[GTF_ATTR_MAX]; /* 8192 bytes */
+} GtfRawRecord;
+```
+
+Any string longer than the array minus one will be silently truncated.
+In practice, NCBI RefSeq files fit within these limits.
+
+**`GtfRecord`** is stored inside `GtfTable`. Its string fields are pointers
+rather than embedded arrays:
+
+```c
+typedef struct {
+    const char *seqname;   /* interned — owned by the table's pool */
+    const char *source;    /* interned — owned by the table's pool */
+    const char *feature;   /* interned — owned by the table's pool */
+    long  start;
+    long  end;
+    float score;
+    char  strand;
+    int   frame;
+    char *attributes;      /* heap-allocated — owned by this record */
 } GtfRecord;
 ```
+
+`seqname`, `source`, and `feature` point into a shared *string intern pool*
+(§18): every record on chromosome 1 shares the same single allocation of
+`"chr1"`, so pointer equality is string equality. `attributes` is unique per
+record and allocated with `strndup_safe` during loading.
+
+The size of a `GtfRecord` on disk is ~40 bytes of fixed fields plus a pointer.
+The `attributes` string averages ~100 bytes. This is a **60× reduction** from
+the ~9 KB that the original fixed-array layout required per record.
 
 A `struct` groups related values into a single named unit. Without `typedef`
 you would write `struct GtfRecord rec` everywhere. The `typedef` lets you
 write just `GtfRecord rec`.
-
-**Fixed-size char arrays** (`char seqname[256]`) are the simplest way to
-store strings in C. The entire storage is embedded directly inside the struct
-— no pointers, no heap allocation, no `malloc`. When you declare `GtfRecord rec`
-as a local variable, the compiler reserves exactly `sizeof(GtfRecord)` bytes
-on the stack.
-
-The trade-off: any string longer than 255 characters (plus null terminator)
-will be silently truncated. In practice, NCBI RefSeq GTF files fit within
-these limits. A future step could replace these arrays with heap-allocated
-`char *` pointers to remove the cap entirely.
 
 **Sentinel values** encode "not applicable" without a separate boolean flag:
 
@@ -237,7 +265,7 @@ accidentally compare it equal to anything — `NAN == NAN` is always false
 ### Function declarations
 
 ```c
-int  gtf_parse_line(const char *line, GtfRecord *rec);
+int  gtf_parse_line(const char *line, GtfRawRecord *rec);
 void gtf_print(const GtfRecord *rec);
 ```
 
@@ -249,22 +277,32 @@ code lives in `gtf.c`.
 `const char *line` — a pointer to char, with `const` on the data. The
 function promises not to modify the string it receives.
 
-`GtfRecord *rec` — a pointer to a `GtfRecord`. The function will write
-results into the struct the caller provides. This is how C functions
-"return" multiple values — pass a pointer to where you want the output.
+`GtfRawRecord *rec` — a pointer to the caller's scratch buffer. The
+function writes tab-parsed fields into the fixed arrays. Using
+`GtfRawRecord` (not `GtfRecord`) here is intentional: the parser just
+fills arrays; the conversion to interned pointer fields happens in
+`gtf_table_load`. `stats.c` and `compare.c` use `GtfRawRecord` directly
+and never build a `GtfTable`.
 
-### GtfTable and GtfAttrs
+### GtfTable and related types
 
-`gtf.h` also declares two higher-level types built on top of `GtfRecord`:
+`gtf.h` declares several higher-level types built on top of `GtfRecord`:
+
+**`StrPool`** is a dynamic array of `char *` — the intern pool that owns
+all `seqname`/`source`/`feature` strings stored in a `GtfTable`. See §18.
+
+**`HEntry` / `HTable`** form an open-addressing hash table mapping
+interned `const char *` keys to `size_t` values. The table's `index` field
+uses this to map each seqname to the first record index in the sorted
+array, giving O(1) chromosome lookup. See §19.
 
 **`GtfTable`** holds a heap-allocated, dynamically-grown array of every
-record in a file. It is the in-memory representation of the whole file,
-as opposed to streaming one record at a time. See section 11.
+record in a file, plus the intern pool and the hash index. See §11.
 
 **`GtfAttr` / `GtfAttrs`** represent the parsed attributes column: a
 dynamic array of `{char *key; char *value;}` pairs allocated on the heap
 on demand. Rather than scanning the raw attribute string each time you need
-a value, you parse once and look up by key. See section 13.
+a value, you parse once and look up by key. See §13.
 
 ---
 
@@ -370,14 +408,14 @@ they would corrupt each other's progress. The thread-safe version is
 `strtok_r`, which takes an explicit `char **saveptr` argument instead of
 using hidden state.
 
-#### Copying fields into the struct
+#### Copying fields into the scratch buffer
 
 ```c
 strncpy(rec->seqname, fields[0], GTF_FIELD_MAX - 1);
 rec->seqname[GTF_FIELD_MAX - 1] = '\0';
 ```
 
-`rec` is a pointer to the caller's `GtfRecord`. The `->` operator is
+`rec` is a pointer to the caller's `GtfRawRecord`. The `->` operator is
 shorthand: `rec->seqname` means `(*rec).seqname` — dereference the pointer
 to get the struct, then access the field. Writing to `rec->seqname` writes
 directly into the caller's memory; no copy of the struct is made.
@@ -385,6 +423,11 @@ directly into the caller's memory; no copy of the struct is made.
 We copy the bytes that `fields[0]` points to into the struct's fixed array.
 This is the crucial step that makes our data safe — once copied, the struct
 fields no longer depend on `buf`, which disappears when the function returns.
+
+`gtf_parse_line` fills only a `GtfRawRecord` (fixed arrays). The conversion
+to a `GtfRecord` with interned pointer fields happens in `gtf_table_load`:
+it calls `str_pool_intern` for the three short fields and `strndup_safe` for
+`attributes`. See §18.
 
 #### Parsing numeric and special fields
 
@@ -452,28 +495,33 @@ int main(int argc, char *argv[])
     const char *cmd = argv[1];
 
     /* compare: two file arguments */
-    if (strcmp(cmd, "compare") == 0) {
-        if (argc < 4) { ... }
-        return cmd_compare(argv[2], argv[3]);
+    if (strcmp(cmd, "compare") == 0) { ... }
+
+    /* print: own block — accepts optional --chrom / --source flags */
+    if (strcmp(cmd, "print") == 0) {
+        /* scan argv for --chrom=..., --source=..., and the file path */
+        ...
+        int rc = cmd_print(fp, chrom_list, source_list);
+        ...
     }
 
-    /* filter / attrs: one string argument then a file */
-    if (strcmp(cmd, "filter") == 0 || strcmp(cmd, "attrs") == 0) {
+    /* filter, merge, attrs, overlap: one string arg then a file */
+    if (strcmp(cmd, "filter")  == 0 || strcmp(cmd, "merge")   == 0 ||
+        strcmp(cmd, "attrs")   == 0 || strcmp(cmd, "overlap") == 0) {
         if (argc < 4) { ... }
         FILE *fp = fopen(argv[3], "r");
-        int rc = (strcmp(cmd, "filter") == 0)
-                 ? cmd_filter(fp, argv[2])
-                 : cmd_attrs(fp, argv[2]);
+        int rc;
+        if      (strcmp(cmd, "filter")  == 0) rc = cmd_filter(fp,  argv[2]);
+        else if (strcmp(cmd, "merge")   == 0) rc = cmd_merge(fp,   argv[2]);
+        else if (strcmp(cmd, "attrs")   == 0) rc = cmd_attrs(fp,   argv[2]);
+        else                                  rc = cmd_overlap(fp,  argv[2]);
         fclose(fp);
         return rc;
     }
 
-    /* print / stats: one file argument */
-    if (argc < 3) { usage(argv[0]); return 1; }
+    /* stats: one file argument */
     FILE *fp = fopen(argv[2], "r");
-    // ...
-    if      (strcmp(cmd, "print") == 0) ret = cmd_print(fp);
-    else if (strcmp(cmd, "stats") == 0) ret = cmd_stats(fp);
+    if (strcmp(cmd, "stats") == 0) ret = cmd_stats(fp);
     else { fprintf(stderr, "unknown command: %s\n", cmd); ... }
 }
 ```
@@ -499,35 +547,34 @@ and `bedtools`. The key advantage over flags (`-p`, `-s`) is that each
 subcommand can grow its own options later without polluting a shared flag
 namespace.
 
-**Three argument shapes.** Commands fall into three groups based on how
-many arguments they need, and the shapes are checked from most-specific to
-least-specific:
+**Four argument shapes.** Commands fall into four groups checked from
+most-specific to least-specific:
 
 | Shape | Commands | `argv` layout |
 |-------|----------|---------------|
 | Two files | `compare` | `argv[2]`, `argv[3]` are both files |
-| String + file | `filter`, `attrs` | `argv[2]` is a string, `argv[3]` is a file |
-| One file | `print`, `stats` | `argv[2]` is a file |
+| Flags + file | `print` | scanned for `--chrom`/`--source`; file is last positional arg |
+| String + file | `filter`, `merge`, `attrs`, `overlap` | `argv[2]` is a string, `argv[3]` is a file |
+| One file | `stats` | `argv[2]` is a file |
 
 Checking the special cases first is a common C idiom: each block either
 returns or falls through to the next, so the final `fopen(argv[2])` is only
-reached by commands that actually take exactly one file argument. If `compare`
-were not checked first, `fopen(argv[2])` would try to open `"a.gtf"` as the
-file for a two-file command — wrong.
+reached by commands that take exactly one file argument.
 
-**Sharing a dispatch case.** `filter` and `attrs` have identical argument
-shapes (`<string> <file>`), so they are handled by a single `if` block.
-A ternary chooses which function to call:
+**`print` gets its own block.** The `--chrom` and `--source` options are
+optional and combinable, which does not fit the simple `argv[2]`/`argv[3]`
+pattern. The `print` block scans all remaining arguments: anything starting
+with `--` is a flag; anything else is the file path. `cmd_print` receives
+the comma-separated filter lists (or `NULL` for no filter):
 
 ```c
-int rc = (strcmp(cmd, "filter") == 0)
-         ? cmd_filter(fp, argv[2])
-         : cmd_attrs(fp, argv[2]);
+static int cmd_print(FILE *fp, const char *chrom_list, const char *source_list)
 ```
 
-This is cleaner than duplicating the `fopen`/`fclose` pair. The pattern
-scales: when a third command with the same shape is added, only the ternary
-needs to grow.
+**Sharing a dispatch case.** `filter`, `merge`, `attrs`, and `overlap` all
+take the same shape (`<string> <file>`), so they share one `if` block with
+a chain of comparisons to pick the right function. The `fopen`/`fclose`
+pair appears once regardless of how many commands share the shape.
 
 ### Splitting the commands into static functions
 
@@ -1391,18 +1438,18 @@ addresses are returned.
 This section describes the known constraints of the current code: what has
 been addressed and what remains.
 
-### Buffer size caps in `GtfRecord` — still present
+### Buffer size caps — partially addressed
 
-`seqname`, `source`, and `feature` are capped at 255 characters.
-`attributes` is capped at 8191 characters. Any value longer than these
-limits is silently truncated. In practice, GTF files from NCBI RefSeq
-(tested on 1.7 million records) fit within these limits.
+**Stored records** — addressed in §18. `GtfRecord` now stores
+`seqname`/`source`/`feature` as interned `const char *` pointers and
+`attributes` as a `strndup`'d `char *`. There is no fixed cap on what
+the table holds; the exact string is preserved.
 
-Removing the cap requires replacing `char field[N]` with `char *field`
-and heap-allocating each string with `malloc(strlen(src) + 1)`. That change
-would turn `GtfRecord` from a value type (copyable by assignment) into a
-type that owns heap memory and must be explicitly freed — a larger API
-change that is deferred to a future step.
+**Parsing** — still present. `GtfRawRecord` (the scratch buffer used by
+`gtf_parse_line`) still has `char seqname[256]` etc. A value longer than
+255 characters is silently truncated *before* it reaches the pool. Removing
+this last cap would require replacing `fgets` + `strtok` with `getline`
+and scanning the raw buffer without a fixed intermediate copy.
 
 ### Line length cap — still present
 
@@ -1439,11 +1486,13 @@ look up by key, free when done. The `attrs` command demonstrates it.
 to parse sequence data as annotation records. `gff3_attrs_parse` handles
 the `key=value;` attribute syntax. See section 14.
 
-### Sorting and interval queries — addressed in Steps 5 and 7
+### Sorting and interval queries — addressed in Steps 5, 7, and further refined
 
-`gtf_table_sort` sorts the table in place by `(seqname, start, end)`.
-`gtf_table_query` uses binary search to locate a chromosome then scans
-forward, giving O(log n + k) per query. See sections 15 and 16.
+`gtf_table_sort` sorts the table in place by `(seqname, start, end)` and
+then builds a hash index (§19) mapping each seqname to its first sorted
+index. `gtf_table_query` uses the hash index for O(1) chromosome lookup,
+then scans forward using pointer comparison for seqname-block detection,
+giving O(1 + k) per query after sorting. See §15, §16, §19.
 
 ### `stats.c` loads all exon records into memory
 
@@ -1478,19 +1527,26 @@ typedef struct {
     size_t     cap;
     size_t     n_skipped;
     size_t     n_errors;
+    GtfFormat  format;   /* GTF_FMT_GTF or GTF_FMT_GFF3 */
+    StrPool    pool;     /* owns all interned seqname/source/feature strings */
+    HTable    *index;    /* seqname → first sorted index; NULL until sorted */
 } GtfTable;
 ```
 
-- `recs` — pointer to the heap-allocated array of records.
+- `recs` — pointer to the heap-allocated array of `GtfRecord` values.
 - `n` — the number of valid records currently stored.
 - `cap` — the allocated capacity (always `>= n`).
-- `n_skipped` — count of comment and blank lines encountered while loading.
+- `n_skipped` — count of comment and blank lines while loading.
 - `n_errors` — count of lines that failed to parse.
+- `format` — detected file format (`GTF_FMT_GTF` or `GTF_FMT_GFF3`).
+- `pool` — the string intern pool that owns every `seqname`, `source`, and
+  `feature` string stored in `recs`. See §18.
+- `index` — hash table built by `gtf_table_sort`; maps each seqname to the
+  first record index on that chromosome. `NULL` until `gtf_table_sort` is
+  called. See §19.
 
-The last two fields carry diagnostic information without requiring the
-caller to maintain separate counters. They are written to `stderr` by
-commands that care (`cmd_print`), and ignored by commands that do not
-(`cmd_filter`, `cmd_attrs`).
+The diagnostic fields are written to `stderr` by commands that care
+(`cmd_print`) and ignored by commands that do not.
 
 ### `gtf_table_load`
 
@@ -1498,55 +1554,60 @@ commands that care (`cmd_print`), and ignored by commands that do not
 GtfTable *gtf_table_load(FILE *fp)
 {
     GtfTable *t = malloc(sizeof(GtfTable));
-    // ...
-    t->cap  = GTF_TABLE_INIT_CAP;   /* 4096 */
+    // ... initialise fields including pool and index = NULL ...
     t->recs = malloc(t->cap * sizeof(GtfRecord));
 
     char line[65536];
-    GtfRecord rec;
+    GtfRawRecord raw;   /* stack scratch buffer, re-used each iteration */
 
     while (fgets(line, sizeof(line), fp)) {
-        int ret = gtf_parse_line(line, &rec);
+        int ret = gtf_parse_line(line, &raw);
         if (ret == 1) { t->n_skipped++; continue; }
         if (ret == -1) { t->n_errors++;  continue; }
 
-        if (t->n >= t->cap) {
-            size_t new_cap = t->cap * 2;
-            GtfRecord *tmp = realloc(t->recs, new_cap * sizeof(GtfRecord));
-            if (!tmp) { gtf_table_free(t); return NULL; }
-            t->recs = tmp;
-            t->cap  = new_cap;
-        }
-        t->recs[t->n++] = rec;
+        // grow recs array if needed (same doubling pattern as before) ...
+
+        GtfRecord *r  = &t->recs[t->n];
+        r->seqname    = str_pool_intern(&t->pool, raw.seqname);
+        r->source     = str_pool_intern(&t->pool, raw.source);
+        r->feature    = str_pool_intern(&t->pool, raw.feature);
+        r->start      = raw.start;
+        r->end        = raw.end;
+        r->score      = raw.score;
+        r->strand     = raw.strand;
+        r->frame      = raw.frame;
+        r->attributes = strndup_safe(raw.attributes, strlen(raw.attributes));
+        t->n++;
     }
     return t;
 }
 ```
 
-**Three-way return from `gtf_parse_line`.** The function returns `1` for
-comments/blanks (increment `n_skipped`, continue), `-1` for parse errors
-(increment `n_errors`, continue), and `0` for a valid record. Only `0`
-causes a record to be added to the table.
+**`GtfRawRecord raw` — a stack scratch buffer.** Every iteration overwrites
+the same stack memory. `gtf_parse_line` fills the fixed arrays, then we
+convert into the table slot by calling `str_pool_intern` (which either
+returns an existing pooled pointer or allocates a new one) and
+`strndup_safe` (which copies the exact attribute string to the heap).
+
+**Three-way return from `gtf_parse_line`.** Returns `1` for comments/blanks
+(increment `n_skipped`), `-1` for errors (increment `n_errors`), and `0`
+for a valid record. Only `0` causes a record to be added.
 
 **Grow before insert.** The capacity check comes *before* storing the new
-record. The invariant is: `t->n < t->cap` at the point of assignment.
-Checking after would risk writing one past the end of the array.
+record, maintaining the invariant `t->n < t->cap` at the point of assignment.
 
-**`realloc` via a temporary.** As explained in section 6, assigning
-`realloc`'s return value directly to `t->recs` would leak the old allocation
-if `realloc` returned `NULL`. The temporary `tmp` avoids this.
+**`realloc` via a temporary.** Assigning `realloc`'s return value directly
+to `t->recs` would leak the old allocation if `realloc` returned `NULL`.
+The temporary `tmp` avoids this.
 
-**`t->recs[t->n++] = rec` — struct assignment.** C copies a struct by value
-when you assign it with `=`. Every field of `rec` is copied into the next
-slot of the array. After this line, the table's copy is independent of the
-local `rec` — modifying `rec` on the next iteration does not affect what
-was stored.
+**Field-by-field fill, not struct assignment.** Unlike the old
+`t->recs[t->n++] = rec`, the new code fills one field at a time using
+`str_pool_intern` and `strndup_safe`. The struct cannot be bulk-copied
+because each pointer field needs its own allocation decision.
 
-**Failure path calls `gtf_table_free`.** If `realloc` fails mid-load, we
-call `gtf_table_free(t)` before returning `NULL`. This frees the partially
-filled table rather than leaking it. `gtf_table_free` handles a partially
-initialised `GtfTable` safely because it only frees `t->recs` and `t` — both
-of which are valid at that point.
+**Failure path calls `gtf_table_free`.** If any allocation fails mid-load,
+`gtf_table_free(t)` frees the partially filled table. The free function
+handles partial initialisation safely — see below.
 
 ### `gtf_table_free`
 
@@ -1554,20 +1615,35 @@ of which are valid at that point.
 void gtf_table_free(GtfTable *t)
 {
     if (!t) return;
+    for (size_t i = 0; i < t->n; i++)
+        free(t->recs[i].attributes);    /* each record owns its attributes */
     free(t->recs);
+    for (size_t i = 0; i < t->pool.n; i++)
+        free(t->pool.data[i]);          /* pool owns the interned strings */
+    free(t->pool.data);
+    htable_free(t->index);              /* frees slots and HTable struct */
     free(t);
 }
 ```
 
-This is simpler than `cmp_free_transcripts` (section 7) because `GtfRecord`
-is a value type — it contains no pointers to separately allocated memory, so
-there is nothing to free inside each record. A single `free(t->recs)` releases
-the entire array at once.
+After string interning, `GtfRecord` is no longer a plain value type — it
+contains `char *attributes` (heap-allocated per record) and `const char *`
+pointer fields (pool-owned). The free cascade must handle three ownership
+layers before freeing the container:
 
-Compare with `Transcript`, which has an `IntronSpan *introns` pointer in
-each element: that design requires a loop to free each intron array before
-freeing the outer array. `GtfRecord`'s fixed-size embedded arrays avoid
-this complexity, at the cost of the size caps discussed in section 10.
+1. **Per-record**: free each `attributes` string individually.
+2. **Pool**: free each interned string in `pool.data`, then `pool.data` itself.
+3. **Index**: `htable_free` frees the slot array and `HTable` struct.
+   It does *not* free the key strings — those are in the pool (layer 2).
+
+Compare with the original one-liner `free(t->recs); free(t)`: that worked
+because the old `GtfRecord` had only fixed-size embedded arrays and no
+separately allocated memory. The switch to pointer fields trades simplicity
+of freeing for a 60× reduction in memory usage.
+
+Compare also with `Transcript` in `compare.c`, which has `IntronSpan *introns`
+in each element — it also requires a loop to free inner allocations before
+the outer array. The pattern is the same: owner frees contents, then container.
 
 ---
 
@@ -1608,11 +1684,17 @@ The `overlap` command (section 16) shows this payoff: it sorts the table in
 place after loading, then binary-searches it — a step that would be impossible
 without the whole file in memory.
 
-**`strcmp` on a struct field.** `t->recs[i].feature` is a `char` array
-embedded in the `GtfRecord`. `strcmp` takes two `const char *` arguments —
-passing an array name decays to a pointer to its first element automatically.
-This is the array-to-pointer decay rule: in most expression contexts, an
-array name becomes a pointer to its first element.
+**`strcmp` on a struct field.** `t->recs[i].feature` is a `const char *`
+— an interned pointer stored directly in the `GtfRecord`. `strcmp` takes
+two `const char *` arguments and works identically whether the string came
+from a fixed array or a heap allocation. No array-to-pointer decay is
+needed here; the field is already a pointer.
+
+(In earlier versions `feature` was `char feature[GTF_FIELD_MAX]`, an
+embedded array. In that case, passing `t->recs[i].feature` to `strcmp`
+relied on array-to-pointer decay: an array name, in most expression
+contexts, becomes a pointer to its first element. The call was syntactically
+the same but the underlying type was different.)
 
 ---
 
@@ -2058,8 +2140,8 @@ lexicographically, which means chromosome names sort as `chr1, chr10,
 chr11, chr2` rather than `chr1, chr2, chr10, chr11`. This is a known
 limitation of naive sorting. Tools like `bedtools` use a reference
 genome's chromosome order instead. For our purposes, what matters is
-consistency: `gtf_table_query` uses the same `strcmp` to binary-search, so
-the sort order and search order always agree.
+consistency: both the sort order and the hash index use the same string
+identity, so a query for `"chr1"` will always find the correct block.
 
 ### `gtf_table_sort`
 
@@ -2067,20 +2149,31 @@ the sort order and search order always agree.
 void gtf_table_sort(GtfTable *t)
 {
     qsort(t->recs, t->n, sizeof(GtfRecord), rec_cmp);
+
+    htable_free(t->index);
+    t->index = htable_new(64);
+    for (size_t i = 0; i < t->n; i++) {
+        if (i == 0 || t->recs[i].seqname != t->recs[i - 1].seqname)
+            htable_insert(t->index, t->recs[i].seqname, i);
+    }
 }
 ```
 
-A one-line wrapper. `qsort` sorts the array **in place** — the `GtfRecord`
-values physically move within `t->recs`. This has an important consequence:
-any pointer you took into the array before sorting (`GtfRecord *p =
-&t->recs[42]`) may now point to a completely different record. This is why
-`gtf_table_query` is always called *after* `gtf_table_sort`, and why
-`cmd_overlap` does not store any record pointers before sorting.
+`qsort` sorts the array **in place** — `GtfRecord` values physically move
+within `t->recs`. Any pointer taken before sorting may point to a different
+record afterwards; this is why `gtf_table_query` is always called *after*
+`gtf_table_sort`.
 
-`qsort` is not guaranteed to be stable (equal elements may appear in any
-order relative to each other). For our purposes this does not matter —
-records at identical `(seqname, start, end)` coordinates are duplicates
-from the annotation perspective.
+After sorting, the function immediately builds the seqname index. Because
+seqnames are interned (§18), consecutive records with the same chromosome
+share the same pointer. The boundary check `seqname != prev_seqname` is a
+pointer comparison — O(1) and touching no string data. Each unique seqname
+is inserted into the hash table with the index of its first record. See §19
+for the full hash table discussion.
+
+`qsort` is not guaranteed to be stable. For our purposes this does not
+matter — records at identical `(seqname, start, end)` coordinates are
+duplicates from the annotation perspective.
 
 ---
 
@@ -2100,7 +2193,29 @@ In our notation: record `r` overlaps query `[qstart, qend]` when
 `r.start <= qend AND r.end >= qstart`. This is the test applied inside
 `gtf_table_query`.
 
-### The lower-bound binary search
+### Finding the start of the seqname block
+
+There are two paths, chosen by whether the hash index has been built:
+
+**Primary path — hash index (O(1)).** After `gtf_table_sort`, `t->index`
+maps each seqname to the first record on that chromosome. `htable_get`
+finds the slot by hashing and comparing with `strcmp`, then returns a
+pointer to the stored index:
+
+```c
+if (t->index) {
+    size_t *idx = htable_get(t->index, seqname);
+    if (!idx) return NULL;          /* chromosome not in table at all */
+    lo       = *idx;
+    interned = t->recs[lo].seqname; /* canonical pointer for this seqname */
+}
+```
+
+If `htable_get` returns `NULL`, the chromosome is simply absent — no
+scan is needed, return immediately with zero hits.
+
+**Fallback — lower-bound binary search.** Used when the table has been
+loaded but not yet sorted (i.e. `t->index == NULL`):
 
 ```c
 static size_t lower_bound_seqname(const GtfTable *t, const char *target)
@@ -2117,22 +2232,16 @@ static size_t lower_bound_seqname(const GtfTable *t, const char *target)
 }
 ```
 
-This is the **lower bound** pattern: find the first index where
-`seqname >= target`. It is distinct from `bsearch`, which finds *an*
-element equal to the key (and returns `NULL` if none exists). Lower bound
-always returns a valid index, even when the target is not present — it
-returns the position where the target *would* be inserted to keep the
-array sorted.
-
-The invariant the loop maintains is: every index `< lo` has
-`seqname < target`, and every index `>= hi` has `seqname >= target`.
-When `lo == hi`, that single position is the answer.
+This is the **lower bound** pattern: the first index where
+`seqname >= target`. Unlike `bsearch`, it never returns `NULL` — it returns
+the position where the target *would* be inserted. The invariant: every
+index `< lo` has `seqname < target`; every index `>= hi` has
+`seqname >= target`. When `lo == hi`, that position is the answer.
 
 **`lo + (hi - lo) / 2` vs `(lo + hi) / 2`.** Both compute the midpoint,
-but `(lo + hi)` can overflow when `lo` and `hi` are large `size_t` values
-near `SIZE_MAX`. Subtracting first and adding `lo` afterward keeps the
-intermediate value within bounds. This is a classic binary search bug;
-the safe form is always preferred.
+but `(lo + hi)` can overflow when both are near `SIZE_MAX`. Subtracting
+first keeps the intermediate value in bounds — a classic binary search
+correctness detail.
 
 ### `gtf_table_query`
 
@@ -2141,16 +2250,29 @@ GtfRecord **gtf_table_query(const GtfTable *t, const char *seqname,
                              long qstart, long qend, size_t *count)
 {
     *count = 0;
-    size_t lo = lower_bound_seqname(t, seqname);
+    const char *interned = NULL;
+    size_t lo;
 
-    size_t cap = 16;
-    GtfRecord **hits = malloc(cap * sizeof(GtfRecord *));
+    if (t->index) {
+        size_t *idx = htable_get(t->index, seqname);
+        if (!idx) return NULL;
+        lo = *idx;
+        interned = t->recs[lo].seqname;   /* interned pointer for this seqname */
+    } else {
+        lo = lower_bound_seqname(t, seqname);
+    }
+
+    GtfRecord **hits = malloc(16 * sizeof(GtfRecord *));
 
     for (size_t i = lo; i < t->n; i++) {
-        int cmp = strcmp(t->recs[i].seqname, seqname);
-        if (cmp > 0) break;                      /* (A) past target seqname */
-        if (t->recs[i].start > qend) break;      /* (B) start past query end */
-        if (t->recs[i].end < qstart) continue;   /* (C) ends before query start */
+        if (interned) {
+            if (t->recs[i].seqname != interned) break; /* (A) pointer compare */
+        } else {
+            int cmp = strcmp(t->recs[i].seqname, seqname);
+            if (cmp > 0) break;                        /* (A) strcmp fallback */
+        }
+        if (t->recs[i].start > qend) break;            /* (B) past query end */
+        if (t->recs[i].end < qstart) continue;         /* (C) before query start */
 
         hits[(*count)++] = &t->recs[i];
         // grow hits if needed...
@@ -2161,17 +2283,18 @@ GtfRecord **gtf_table_query(const GtfTable *t, const char *seqname,
 }
 ```
 
-The loop starts at `lo` — the first record that could possibly be on the
-target chromosome — and uses three conditions to process the rest:
+The loop starts at `lo` and uses three conditions to process each record:
 
-**(A) `cmp > 0` — break.** The records are sorted by `(seqname, start)`.
-Once `seqname` is lexicographically greater than the target, every
-subsequent record is also on a later chromosome. There can be no more
-matches; stop immediately.
+**(A) Seqname boundary — break.** When the index is available, this is a
+**pointer comparison**: `t->recs[i].seqname != interned`. Because seqnames
+are interned, every record on the target chromosome holds exactly the same
+pointer; the first record with a different pointer is on a different
+chromosome. When the fallback binary search is used, this falls back to
+`strcmp > 0`. The pointer version is O(1) and touches no string data.
 
 **(B) `start > qend` — break.** Within the target chromosome, records are
 sorted by `start`. Once a record starts after the query ends, no subsequent
-record can overlap (their starts are even later). Stop immediately.
+record can overlap. Stop immediately.
 
 **(C) `end < qstart` — continue.** This record starts within the query's
 coordinate range (`start <= qend`, since condition B did not fire), but it
@@ -2248,3 +2371,772 @@ produce the same error-and-return path.
 is freed — not the records it points to. Those belong to the table and will
 be freed by `gtf_table_free(t)`. Freeing a pointer you do not own corrupts
 the heap; freeing a pointer you do own exactly once is the rule.
+
+---
+
+## 17. Interval merge — a scan on sorted data
+
+### The problem
+
+Genomic annotation files often contain overlapping or adjacent features that
+should be collapsed into non-redundant intervals. Three exon records on the
+same chromosome with overlapping coordinates represent the same transcribed
+region; the merge command reduces them to one interval spanning the combined
+range and records how many source intervals were collapsed.
+
+### The algorithm: scan on sorted data
+
+The algorithm is a *running-window sweep* on a sorted sequence:
+
+1. Sort all records by (seqname, start, end) — groups everything by
+   chromosome and ensures left-to-right encounter order.
+2. Walk through the records maintaining a "current interval" (`cur`).
+3. If the next record is on the same chromosome AND starts at or before
+   `cur.end + 1` (overlapping or adjacent), extend `cur.end` if needed.
+4. Otherwise, emit `cur` and start a new interval from the current record.
+5. After the loop, emit the final `cur`.
+
+```c
+for (size_t i = 0; i < t->n; i++) {
+    GtfRecord *r = &t->recs[i];
+    if (strcmp(r->feature, feature) != 0) continue;
+
+    if (!in_merge) { cur = *r; cur_count = 1; in_merge = 1; continue; }
+
+    if (strcmp(r->seqname, cur.seqname) == 0 && r->start <= cur.end + 1) {
+        if (r->end > cur.end) cur.end = r->end;   /* extend */
+        cur_count++;
+    } else {
+        /* emit and start over */
+        snprintf(merge_attrs, sizeof(merge_attrs),
+                 "merged_count \"%zu\";", cur_count);
+        cur.attributes = merge_attrs;
+        gtf_print(&cur);
+        cur = *r; cur_count = 1;
+    }
+}
+if (in_merge) { /* emit the last interval */ }
+```
+
+**Why sort first?** Without sorting you would need to compare every record
+against every other — O(n²). Sorting costs O(n log n), then the sweep is
+O(n). One sort unlocks a single pass, which is the fundamental pattern
+behind most "efficient scan" algorithms in bioinformatics.
+
+**The adjacency condition `r->start <= cur.end + 1`.** GTF uses 1-based
+closed coordinates. The intervals [900, 1200] and [1201, 1500] share no
+bases, but 1201 is immediately after 1200 — they are adjacent with no gap.
+Adding 1 merges them. Whether you want this is domain-specific; removing
+the `+ 1` gives overlap-only merging.
+
+### `cur = *r` — shallow struct copy
+
+`GtfRecord` contains pointers (`const char *seqname`, `char *attributes`).
+`cur = *r` is a *shallow copy*: it copies the pointer values, not the data
+they point to. `cur.seqname` now holds the same address as `r->seqname`.
+
+This is intentional and safe here because:
+- `seqname`, `source`, `feature` are pool-owned and remain valid until
+  `gtf_table_free` — we only read them through `cur`.
+- `attributes` is owned by the original table record. We overwrite
+  `cur.attributes` with `merge_attrs` before printing, so we never
+  read or modify the original through `cur`.
+
+### The local buffer trick
+
+The merged record's attributes need a freshly formatted string for each
+emitted interval. Formatting into a `char merge_attrs[64]` on the stack
+and temporarily redirecting `cur.attributes` at it avoids any `malloc`:
+
+```c
+char merge_attrs[64];   /* lives for the whole function */
+
+/* inside the loop, before gtf_print: */
+snprintf(merge_attrs, sizeof(merge_attrs),
+         "merged_count \"%zu\";", cur_count);
+cur.attributes = merge_attrs;   /* point cur at the stack buffer */
+gtf_print(&cur);                /* reads cur.attributes — buffer is alive */
+cur = *r;                       /* overwrites the pointer; buffer still fine */
+```
+
+`gtf_print` only reads through the pointer. The buffer is alive for the
+entire duration of the function, so there is no dangling-pointer risk.
+This pattern — temporarily redirecting a pointer to a stack buffer for a
+read-only operation — is common in C when you want to avoid heap allocation
+for a short-lived value.
+
+### Single-pass streaming output
+
+`cmd_merge` does not collect all merged intervals before printing — it
+emits each one as soon as it is finalised. Peak memory is just the
+`GtfTable` (needed for sorting) plus a single `GtfRecord cur` on the
+stack. The output streams out of the program as it is produced.
+
+---
+
+## 18. String interning — one allocation per unique string
+
+### The memory problem
+
+The original `GtfRecord` had four fixed-size character arrays:
+
+```c
+char seqname[256];      /*  256 bytes */
+char source[256];       /*  256 bytes */
+char feature[256];      /*  256 bytes */
+char attributes[8192];  /* 8192 bytes */
+                        /* ≈ 9 KB per record */
+```
+
+Across 1.7 million records: **~15 GB** just for the record array — well
+beyond the RAM of most workstations.
+
+The observation: `seqname`, `source`, and `feature` repeat heavily. A real
+annotation file might have fewer than 100 unique chromosome names, fewer
+than 10 unique sources, and fewer than 20 unique feature types. Storing a
+256-byte copy of `"chr1"` in every one of the 300 000 records that live on
+chromosome 1 is pure waste. The `attributes` field, however, is unique per
+record — it contains gene IDs, transcript IDs, etc.
+
+**String interning** stores exactly one copy of each unique string in a
+pool, and every user of that string holds a pointer to the pooled copy
+rather than its own copy. Two records on `chr1` share one `"chr1"` heap
+allocation.
+
+### `GtfRawRecord` vs `GtfRecord` — why two structs
+
+The challenge: `gtf_parse_line` writes into a `GtfRecord` using `strncpy`.
+If `seqname` becomes a `const char *` pointer rather than a `char[256]`
+array, there is nowhere to write into — the pointer has no backing storage.
+
+The solution is to split the type:
+
+```c
+/* Scratch buffer — allocated on the stack for one line's parse. */
+typedef struct {
+    char seqname[GTF_FIELD_MAX];    /* writable arrays */
+    char source[GTF_FIELD_MAX];
+    char feature[GTF_FIELD_MAX];
+    long start, end; float score; char strand; int frame;
+    char attributes[GTF_ATTR_MAX];
+} GtfRawRecord;
+
+/* Stored in the table — thin pointers, heap-allocated attributes. */
+typedef struct {
+    const char *seqname;   /* interned — owned by the pool */
+    const char *source;    /* interned — owned by the pool */
+    const char *feature;   /* interned — owned by the pool */
+    long start, end; float score; char strand; int frame;
+    char *attributes;      /* heap-allocated — owned by this record */
+} GtfRecord;
+```
+
+`gtf_parse_line` fills a `GtfRawRecord` on the stack — a temporary that
+disappears when the function returns. `gtf_table_load` then converts it to
+a `GtfRecord` by interning the three short fields and copying attributes:
+
+```c
+GtfRecord *r = &t->recs[t->n];
+r->seqname    = str_pool_intern(&t->pool, raw.seqname);
+r->source     = str_pool_intern(&t->pool, raw.source);
+r->feature    = str_pool_intern(&t->pool, raw.feature);
+r->attributes = strndup_safe(raw.attributes, strlen(raw.attributes));
+```
+
+`stats.c` and `compare.c` use `GtfRawRecord` directly (they parse
+line-by-line without building a table) and needed a single change each:
+`GtfRecord rec` → `GtfRawRecord rec`.
+
+### `StrPool` — the intern pool
+
+```c
+typedef struct {
+    char  **data;   /* heap array of heap-allocated strings */
+    size_t  n;
+    size_t  cap;
+} StrPool;
+```
+
+The pool is a dynamic array of `char *`. `str_pool_intern` does a linear
+scan; if the string already exists it returns the stored pointer, otherwise
+it appends a new copy:
+
+```c
+static const char *str_pool_intern(StrPool *pool, const char *s)
+{
+    for (size_t i = 0; i < pool->n; i++)
+        if (strcmp(pool->data[i], s) == 0) return pool->data[i];
+
+    /* not found — grow the pool and append */
+    /* ... realloc pool->data ... */
+    char *dup = strndup_safe(s, strlen(s));
+    pool->data[pool->n++] = dup;
+    return dup;
+}
+```
+
+Linear scan is O(unique strings) per intern call. With ~100 unique seqnames
+and ~20 unique features, this is at most ~120 comparisons per record —
+negligible against the parsing overhead.
+
+### `const char *` vs `char *` — communicating ownership
+
+The interned fields are `const char *`: the caller may read but not write
+or free them. The pool is the sole owner. `attributes` is `char *` because
+it is uniquely owned by each record.
+
+This is not just style. If `seqname` were `char *`, nothing in the type
+system would stop a careless `free(rec->seqname)` — which would corrupt
+the pool and cause a double-free when the pool itself is cleaned up.
+`const char *` makes the prohibition explicit.
+
+### Updated `gtf_table_free`
+
+The free cascade now has three layers:
+
+```c
+void gtf_table_free(GtfTable *t) {
+    /* 1. Each record's uniquely-owned attributes string */
+    for (size_t i = 0; i < t->n; i++)
+        free(t->recs[i].attributes);
+    free(t->recs);
+
+    /* 2. The pool's interned strings */
+    for (size_t i = 0; i < t->pool.n; i++)
+        free(t->pool.data[i]);
+    free(t->pool.data);
+
+    /* 3. The hash index (see §19) */
+    htable_free(t->index);
+    free(t);
+}
+```
+
+Order matters: always free the contents before the container that holds
+them. Freeing `t->recs` first (before freeing attributes) would not cause
+a bug here because the attribute pointers are copied into each `GtfRecord`
+individually — but it would make the free loop impossible.
+
+### Memory impact
+
+After interning, each `GtfRecord` is ~40 bytes of fixed-size fields plus
+a pointer. The `attributes` string averages ~100 bytes (the real text, not
+a fixed 8 KB buffer). Per record: ~140 bytes. Across 1.7 M records:
+**~240 MB** — a **60× reduction** from the original fixed-buffer layout.
+
+### Pointer equality as string equality
+
+Once strings are interned, the same string value has exactly one address.
+This means:
+
+```c
+/* Before interning: O(string_length) */
+strcmp(rec_a->seqname, rec_b->seqname) == 0
+
+/* After interning: O(1) */
+rec_a->seqname == rec_b->seqname
+```
+
+This is more than a micro-optimisation. It is the key that makes the hash
+table index (§19) fast: detecting where one seqname block ends and the
+next begins during index construction becomes a pointer comparison — no
+string data touched at all.
+
+---
+
+## 19. Hash table — O(1) seqname lookup
+
+### Why a hash table here
+
+`gtf_table_query` needs to jump to the first record with a given seqname
+in the sorted array. The previous implementation used a binary search:
+O(log n). A hash table gives O(1). For 1.7 M records, log₂(1 700 000) ≈ 21
+steps vs one hash lookup — the absolute speed difference is small, but the
+design teaches every fundamental hash table concept: hash functions,
+collision resolution, load factor, resize, and pointer-identity keys.
+
+The index also resolves an ambiguity in the binary search: the lower-bound
+search could land in the middle of a seqname block or just before a
+seqname that does not exist. The hash table returns `NULL` immediately for
+absent chromosomes, and the exact first index for chromosomes that do exist.
+
+### Open addressing with linear probing
+
+Two main collision strategies:
+- **Chaining**: each slot holds a linked list of entries.
+- **Open addressing**: all entries live in the same flat array; on
+  collision, probe adjacent slots.
+
+We use open addressing with *linear probing* — on collision, try `h+1`,
+`h+2`, etc., wrapping around. This keeps all data in one contiguous
+allocation (cache-friendly) and requires no `malloc` per entry.
+
+```c
+typedef struct { const char *key; size_t val; } HEntry;
+
+typedef struct {
+    HEntry *slots;
+    size_t  cap;   /* always a power of 2 */
+    size_t  n;     /* live entries */
+} HTable;
+```
+
+An empty slot is `key == NULL`. `calloc` in `htable_new` zeros the slot
+array, so all slots start empty without an explicit initialisation loop.
+
+**Why power-of-2 capacity?** The slot index is computed as
+`hash & (cap - 1)` instead of `hash % cap`. Bitwise AND is a single
+instruction; modulo by an arbitrary number requires division. The trick
+only works when `cap` is a power of 2 because `cap - 1` is then a bitmask
+with all bits below the capacity bit set.
+
+### FNV-1a — the hash function
+
+```c
+static size_t fnv1a(const char *s)
+{
+    size_t h = 14695981039346656037ULL;   /* FNV offset basis */
+    for (; *s; s++) {
+        h ^= (unsigned char)*s;
+        h *= 1099511628211ULL;            /* FNV prime */
+    }
+    return h;
+}
+```
+
+FNV-1a processes one byte at a time: XOR the byte into the hash, then
+multiply by a chosen prime. The XOR-before-multiply order (FNV-1a) has
+better *avalanche* — a one-bit change in the input changes roughly half
+the output bits — than multiply-before-XOR (FNV-1). The constants are the
+standard 64-bit FNV parameters, derived to avoid common patterns that
+produce clustering. No division, no branching, no tables.
+
+### Load factor and resize
+
+As a hash table fills up, the average *probe length* (how many slots must
+be checked before finding the target or an empty slot) grows. The
+conventional threshold is **75%**: when `n * 4 > cap * 3`, double the
+capacity and rehash.
+
+```c
+static int htable_insert(HTable *ht, const char *key, size_t val)
+{
+    if (ht->n * 4 > ht->cap * 3)
+        htable_resize(ht, ht->cap * 2);
+
+    size_t h = fnv1a(key) & (ht->cap - 1);
+    while (ht->slots[h].key) {
+        /* pointer equality: all stored keys are interned */
+        if (ht->slots[h].key == key) { ht->slots[h].val = val; return 0; }
+        h = (h + 1) & (ht->cap - 1);
+    }
+    ht->slots[h].key = key;
+    ht->slots[h].val = val;
+    ht->n++;
+    return 0;
+}
+```
+
+`htable_resize` allocates a new slot array and re-inserts every live entry
+using the new capacity mask:
+
+```c
+static int htable_resize(HTable *ht, size_t new_cap)
+{
+    HEntry *new_slots = calloc(new_cap, sizeof(HEntry));
+    for (size_t i = 0; i < ht->cap; i++) {
+        if (!ht->slots[i].key) continue;
+        size_t h = fnv1a(ht->slots[i].key) & (new_cap - 1);
+        while (new_slots[h].key) h = (h + 1) & (new_cap - 1);
+        new_slots[h] = ht->slots[i];
+    }
+    free(ht->slots);
+    ht->slots = new_slots;
+    ht->cap   = new_cap;
+    return 0;
+}
+```
+
+Each entry is re-hashed because the slot index `hash & (cap-1)` changes
+when `cap` doubles. Old slot positions are invalid in the new array.
+
+### Building the index in `gtf_table_sort`
+
+The index maps each seqname to the index of its first record in the sorted
+array. After sorting, records with the same seqname are contiguous — the
+first occurrence of each new seqname marks a block boundary.
+
+```c
+void gtf_table_sort(GtfTable *t)
+{
+    qsort(t->recs, t->n, sizeof(GtfRecord), rec_cmp);
+
+    htable_free(t->index);
+    t->index = htable_new(64);
+
+    for (size_t i = 0; i < t->n; i++) {
+        /* pointer inequality: interned strings share one address */
+        if (i == 0 || t->recs[i].seqname != t->recs[i - 1].seqname)
+            htable_insert(t->index, t->recs[i].seqname, i);
+    }
+}
+```
+
+Because `seqname` is interned (§18), detecting block boundaries is a
+pointer comparison — O(1), no string data accessed. This is the payoff of
+combining interning and hashing: the two techniques reinforce each other.
+
+### Using the index in `gtf_table_query`
+
+```c
+if (t->index) {
+    size_t *idx = htable_get(t->index, seqname);
+    if (!idx) return NULL;          /* chromosome not in this file */
+    lo       = *idx;
+    interned = t->recs[lo].seqname; /* the canonical pool pointer */
+} else {
+    lo = lower_bound_seqname(t, seqname);   /* fallback */
+}
+```
+
+`htable_get` uses `strcmp` because the caller's `seqname` (e.g., a stack
+buffer in `cmd_overlap`) is not guaranteed to be the interned pointer:
+
+```c
+static size_t *htable_get(const HTable *ht, const char *key)
+{
+    size_t h = fnv1a(key) & (ht->cap - 1);
+    while (ht->slots[h].key) {
+        if (strcmp(ht->slots[h].key, key) == 0) return &ht->slots[h].val;
+        h = (h + 1) & (ht->cap - 1);
+    }
+    return NULL;
+}
+```
+
+But once the slot is found, `t->recs[lo].seqname` IS the interned pointer.
+The inner scan loop then uses pointer equality instead of `strcmp`:
+
+```c
+for (size_t i = lo; i < t->n; i++) {
+    if (t->recs[i].seqname != interned) break;  /* O(1): pointer compare */
+    if (t->recs[i].start > qend)        break;
+    if (t->recs[i].end   < qstart)      continue;
+    /* collect hit */
+}
+```
+
+`strcmp` appears exactly once (in `htable_get`) and only for as many probe
+steps as there are hash collisions — near zero for a well-loaded table.
+Every other string comparison in the hot path is gone.
+
+### Ownership: the table borrows the keys
+
+`htable_free` frees the slot array and the `HTable` struct, but **not**
+the strings the slots point to:
+
+```c
+void htable_free(HTable *ht)
+{
+    if (!ht) return;
+    free(ht->slots);
+    free(ht);
+}
+```
+
+The keys are interned pointers owned by `t->pool`. The hash table *borrows*
+them — it did not allocate them and must not free them. The pool is freed
+separately in `gtf_table_free`. This is the same owner/borrower pattern
+that governs `gtf_table_query`'s result array: the caller owns the array
+of pointers but not the `GtfRecord` objects the pointers point to.
+
+### Three layers working together
+
+| Layer | What it does | Key concept |
+|---|---|---|
+| `StrPool` (§18) | One allocation per unique string | Pointer equality = string equality |
+| `gtf_table_sort` | Sorts + builds seqname→index map | Pointer comparison to find block edges |
+| `gtf_table_query` | Hash lookup + pointer scan | O(1) jump, O(1) boundary check |
+
+The three ideas form a chain: interning enables cheap equality; cheap
+equality enables the hash index; the hash index collapses O(log n) binary
+search into O(1) lookup and turns the inner scan loop from `strcmp`-per-
+record into a pointer comparison.
+
+---
+
+## §20 BED output — coordinate conversion and format interop
+
+### Why BED?
+
+GTF and GFF3 are the standard exchange formats for gene annotation, but most
+downstream tools in a genome analysis pipeline — bedtools, IGV, UCSC Genome
+Browser, deeptools — consume **BED** instead.  BED is simpler: no attributes
+column, no format variants, and it uses the coordinate system (0-based,
+half-open) that C arrays and most programming languages use naturally.
+
+Implementing a GTF→BED converter is therefore not busywork: it is one of the
+most-used single operations in annotation-adjacent pipelines.
+
+### BED coordinate system
+
+The fundamental difference between GTF and BED:
+
+| Property | GTF/GFF3 | BED |
+|---|---|---|
+| Start is | 1-based | 0-based |
+| End is | inclusive (closed) | exclusive (open, "half-open") |
+| A single base at position 1 | `start=1, end=1` | `start=0, end=1` |
+| Length | `end − start + 1` | `end − start` |
+
+Both representations carry the same information; the conversion is:
+
+```
+BED start = GTF start − 1
+BED end   = GTF end          (no change)
+```
+
+Example: GTF `chr1 . gene 1001 2000` → BED `chr1 1000 2000 . 0 .`
+
+The length is `2000 − 1001 + 1 = 1000` in GTF and `2000 − 1000 = 1000` in
+BED — identical, as expected.
+
+The 0-based convention exists because C arrays are 0-indexed.  A 100-byte
+array has valid indices `[0, 100)` — that is, `arr[0]` through `arr[99]`.
+BED mirrors that: to address bases 1000–2000 of a chromosome stored as a
+C string, you would write `seq + 1000` and copy `2000 - 1000 = 1000` bytes.
+With GTF you would write `seq + start - 1` — the off-by-one is always there
+when interfacing with C strings.
+
+### BED6 columns
+
+The `bed` command produces BED6:
+
+| # | Name | Source |
+|---|------|--------|
+| 1 | chrom | `GtfRecord.seqname` |
+| 2 | chromStart | `GtfRecord.start − 1` |
+| 3 | chromEnd | `GtfRecord.end` |
+| 4 | name | attribute value (via `--name`) or `.` |
+| 5 | score | integer 0–1000 (GTF score clamped), or `0` when NaN |
+| 6 | strand | `GtfRecord.strand` (`+`, `-`, or `.`) |
+
+### Score field: NaN, clamping, and casting
+
+GTF stores the score as a floating-point number, but the BED spec requires
+an integer in `[0, 1000]`.  GTF also uses `.` to mean "no score", which
+the parser stores as `NAN` (from `<math.h>`).  Three things need to happen:
+
+```c
+int score = 0;
+if (!isnan(r->score)) {
+    float s = r->score;
+    score = (s < 0.0f) ? 0 : (s > 1000.0f) ? 1000 : (int)s;
+}
+```
+
+- `isnan()` detects the "no score" sentinel; those records get `0`.
+- The ternary clamps out-of-range values; the cast truncates toward zero.
+- `(int)s` is a *narrowing conversion* — this is safe here because we have
+  already established `0 ≤ s ≤ 1000`, so the result fits in an `int`.
+
+Without the clamp, a GTF score of `9999.7` would truncate to `9999`, violating
+the BED spec.  Without `isnan`, casting `NAN` to `int` is undefined behaviour
+in C — the result is implementation-defined and may trap on some architectures.
+
+### Name field: attribute extraction per record
+
+When `--name` is given, the implementation calls `gtf_attrs_parse` (or
+`gff3_attrs_parse` for GFF3) for every record to extract one attribute value:
+
+```c
+GtfAttrs *attrs = (t->format == GTF_FMT_GFF3)
+                  ? gff3_attrs_parse(r->attributes)
+                  : gtf_attrs_parse(r->attributes);
+if (attrs) {
+    const char *val = gtf_attrs_get(attrs, name_attr);
+    if (val) name = val;
+}
+```
+
+This is the same pattern used by `cmd_attrs`.  Parsing costs one `malloc`
+per record, which is acceptable for an export command that is typically run
+once.  If performance becomes a concern, a targeted single-attribute scanner
+(like the private `attr_get` in `stats.c`) could replace it without changing
+the calling code.
+
+The `name` pointer is valid until `gtf_attrs_free(attrs)` is called (the
+string is part of the `GtfAttrs` allocation).  `printf` runs before
+`gtf_attrs_free`, so the pointer is live.
+
+### Dispatch: the --name flag pattern
+
+`bed` uses the same flag-scanning dispatch pattern as `print` (§5):
+
+```c
+for (int i = 2; i < argc; i++) {
+    if (strcmp(argv[i], "--name") == 0 && i + 1 < argc) {
+        name_attr = argv[++i];               // consume next token
+    } else if (strncmp(argv[i], "--name=", 7) == 0) {
+        name_attr = argv[i] + 7;             // pointer arithmetic into argv[i]
+    } else if (argv[i][0] != '-') {
+        path = argv[i];                      // first non-flag token is the file
+    } else {
+        fprintf(stderr, "error: unknown option '%s'\n", argv[i]);
+        return 1;
+    }
+}
+```
+
+Both `--name gene_id` (two tokens) and `--name=gene_id` (one token) are
+supported.  `argv[i] + 7` is pointer arithmetic: skip the first 7 characters
+(`--name=`) and point directly to the value inside the existing string.
+No allocation, no copy.
+
+### Composing with other commands
+
+Because `bed` reads from a `FILE *` and writes to stdout, it can be piped
+with other `gtfparse` commands.  The `filter` command output is a valid GTF
+stream, which `bed` can read from `/dev/stdin`:
+
+```sh
+# Only gene features, named by gene_id
+./gtfparse filter gene file.gtf | ./gtfparse bed --name gene_id /dev/stdin
+
+# Merge overlapping exons, then convert to BED
+./gtfparse merge exon file.gtf | ./gtfparse bed /dev/stdin
+```
+
+This composability is the payoff of the design decision to always read from
+`FILE *` rather than a file path: any command can feed any other.
+
+---
+
+## §21 Output redirection — argv compaction and freopen
+
+### The problem
+
+Every command writes its output to `stdout` using `printf` or `gtf_print`.
+The user can always redirect that with the shell (`> file.gtf`), but that
+requires the shell.  Inside a script or when the flag position must be
+controlled programmatically, a built-in `-o`/`--output` flag is more
+convenient and self-documenting.
+
+The challenge is that the flag must work with *every* command without
+modifying any `cmd_*` function.
+
+### stdout is just a FILE *
+
+In C, `stdin`, `stdout`, and `stderr` are global variables of type `FILE *`,
+defined in `<stdio.h>`.  They are initialised at program start by the C
+runtime, but they are just ordinary pointers — you can replace what they
+point to.
+
+`freopen` does exactly that:
+
+```c
+FILE *freopen(const char *path, const char *mode, FILE *stream);
+```
+
+It closes `stream`'s current file descriptor, opens `path` in `mode`, and
+re-uses the `FILE` object at the same address.  After the call, any code
+that writes to `stdout` — including code in libraries you didn't write —
+automatically writes to `path` instead.  The pointer value of `stdout`
+doesn't change; only the underlying descriptor does.
+
+```c
+if (!freopen(out_path, "w", stdout)) {
+    perror(out_path);   // prints: "out.gtf: No such file or directory"
+    return 1;
+}
+```
+
+`freopen` returns `NULL` on failure, leaving `stdout` in an indeterminate
+state.  We treat failure as fatal and exit immediately.
+
+### argv compaction
+
+The flag must be removed from `argv` before any dispatch code runs, because
+the `print` and `bed` dispatch blocks reject unknown flags:
+
+```c
+} else {
+    fprintf(stderr, "error: unknown option '%s'\n", argv[i]);
+    return 1;
+}
+```
+
+The solution is to compact `argv` in-place: when the flag is found, shift
+all later elements left by the number of consumed tokens and decrement
+`argc`.
+
+```c
+const char *out_path = NULL;
+for (int i = 1; i < argc; ) {
+    if ((strcmp(argv[i], "--output") == 0 || strcmp(argv[i], "-o") == 0)
+            && i + 1 < argc) {
+        out_path = argv[i + 1];
+        for (int j = i; j < argc - 2; j++)   /* consume 2 tokens */
+            argv[j] = argv[j + 2];
+        argc -= 2;
+    } else if (strncmp(argv[i], "--output=", 9) == 0) {
+        out_path = argv[i] + 9;
+        for (int j = i; j < argc - 1; j++)   /* consume 1 token */
+            argv[j] = argv[j + 1];
+        argc--;
+    } else {
+        i++;
+    }
+}
+```
+
+A few details worth noting:
+
+**The loop does not increment `i` when it removes elements.**  After
+shifting, the element that moved into position `i` is new and hasn't been
+examined yet.  Incrementing would skip it.  This is the standard pattern
+for in-place filtering of an array: only advance when you *keep* the current
+element.
+
+**`argv` is a `char *[]` — an array of pointers.**  Shifting does not copy
+any string data; it only moves the pointers.  The strings themselves live
+in read-only memory provided by the OS and are not touched.
+
+**`argc` is a local variable.**  The C standard says `main`'s `argc` is a
+local copy; modifying it does not affect anything outside `main`.  All
+dispatch code after the pre-pass uses the modified `argc`, which no longer
+counts the consumed flag tokens.
+
+**The `--output=value` form uses pointer arithmetic.**  `argv[i] + 9` skips
+the first nine characters (`--output=`) and points directly into the middle
+of the existing string.  No allocation, no `strncpy`.
+
+### Why a pre-pass rather than per-command handling
+
+An alternative design would add `--output` parsing to each command's own
+flag loop.  That would work but requires touching every dispatch block now
+and every new one in the future.  The pre-pass keeps the concern in one
+place: the `cmd_*` functions never need to know that an output file exists.
+
+This is an instance of a general principle: **cross-cutting concerns belong
+at a single boundary**.  Authentication, logging, and output redirection are
+all examples — they affect every operation but should be handled once, not
+scattered through every operation's implementation.
+
+### stderr stays on the terminal
+
+Diagnostic output — loading progress, record counts, error messages — all
+use `fprintf(stderr, ...)`.  `freopen` only replaces `stdout`; `stderr` is
+unaffected.  This means:
+
+```sh
+./gtfparse filter gene annotation.gtf -o genes.gtf
+# terminal shows:  loading: 100000 records...
+#                  matched=14234  total=1873083
+# genes.gtf gets:  the GTF records
+```
+
+The Unix convention of separating data (stdout) from diagnostics (stderr)
+is what makes this work cleanly.  It is also why piping works: in
+`cmd1 | cmd2`, the shell connects cmd1's stdout to cmd2's stdin while both
+commands' stderrs remain on the terminal.

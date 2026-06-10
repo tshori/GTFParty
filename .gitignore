@@ -4,6 +4,7 @@ gtfparse
 *.env
 *.gtf
 *.gff
+*.gff3
 
 *.bam
 *.bai

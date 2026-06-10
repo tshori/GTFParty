@@ -3,6 +3,9 @@
 
 #include <stddef.h>
 
+/* File format — detected automatically from the ##gff-version pragma. */
+typedef enum { GTF_FMT_GTF = 0, GTF_FMT_GFF3 = 1 } GtfFormat;
+
 #define GTF_FIELD_MAX  256
 #define GTF_ATTR_MAX  8192
 
@@ -47,6 +50,7 @@ typedef struct {
     size_t     cap;
     size_t     n_skipped;
     size_t     n_errors;
+    GtfFormat  format;    /* GTF_FMT_GTF or GTF_FMT_GFF3 */
 } GtfTable;
 
 /*
@@ -57,6 +61,22 @@ typedef struct {
 GtfTable *gtf_table_load(FILE *fp);
 
 void      gtf_table_free(GtfTable *t);
+
+/* Sort all records in place by (seqname, start, end). */
+void gtf_table_sort(GtfTable *t);
+
+/*
+ * Find all records that overlap [qstart, qend] on seqname.
+ * The table must be sorted with gtf_table_sort() before calling this.
+ * Overlap condition (1-based closed): rec.start <= qend && rec.end >= qstart.
+ *
+ * Returns a heap-allocated array of pointers into t->recs, with *count
+ * set to the number of hits.  Returns NULL when *count == 0.
+ * The caller must free the array itself (not the records it points to).
+ * The pointers are only valid while the GtfTable lives.
+ */
+GtfRecord **gtf_table_query(const GtfTable *t, const char *seqname,
+                             long qstart, long qend, size_t *count);
 
 /* ------------------------------------------------------------------ */
 /* Attribute parsing                                                    */
@@ -76,12 +96,13 @@ typedef struct {
 } GtfAttrs;
 
 /*
- * Parse the raw GTF attributes string into a heap-allocated GtfAttrs.
- * Handles both quoted values (key "value";) and unquoted (key value;).
- * Returns NULL on allocation failure.
- * Caller must free with gtf_attrs_free().
+ * Parse GTF attributes  (key "value"; key "value"; ...)  into a GtfAttrs.
+ * Parse GFF3 attributes (key=value;key=value;...)         into a GtfAttrs.
+ * Both return the same GtfAttrs type; free with gtf_attrs_free().
+ * Return NULL on allocation failure.
  */
 GtfAttrs   *gtf_attrs_parse(const char *raw);
+GtfAttrs   *gff3_attrs_parse(const char *raw);
 
 /*
  * Look up a key in a parsed GtfAttrs.

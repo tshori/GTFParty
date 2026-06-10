@@ -82,6 +82,7 @@ GtfTable *gtf_table_load(FILE *fp)
     t->n         = 0;
     t->n_skipped = 0;
     t->n_errors  = 0;
+    t->format    = GTF_FMT_GTF;
     t->recs      = malloc(t->cap * sizeof(GtfRecord));
     if (!t->recs) { free(t); return NULL; }
 
@@ -89,6 +90,16 @@ GtfTable *gtf_table_load(FILE *fp)
     GtfRecord rec;
 
     while (fgets(line, sizeof(line), fp)) {
+        /* GFF3: ##FASTA marks the start of embedded sequences — stop here */
+        if (strncmp(line, "##FASTA", 7) == 0)
+            break;
+        /* GFF3: ##gff-version pragma identifies the format */
+        if (strncmp(line, "##gff-version", 13) == 0) {
+            t->format = GTF_FMT_GFF3;
+            t->n_skipped++;
+            continue;
+        }
+
         int ret = gtf_parse_line(line, &rec);
         if (ret == 1) { t->n_skipped++; continue; }
         if (ret == -1) { t->n_errors++;  continue; }
@@ -111,6 +122,73 @@ void gtf_table_free(GtfTable *t)
     if (!t) return;
     free(t->recs);
     free(t);
+}
+
+/* ------------------------------------------------------------------ */
+/* Sort and overlap query                                               */
+/* ------------------------------------------------------------------ */
+
+static int rec_cmp(const void *a, const void *b)
+{
+    const GtfRecord *ra = (const GtfRecord *)a;
+    const GtfRecord *rb = (const GtfRecord *)b;
+    int c = strcmp(ra->seqname, rb->seqname);
+    if (c) return c;
+    if (ra->start != rb->start) return (ra->start < rb->start) ? -1 : 1;
+    return (ra->end < rb->end) ? -1 : (ra->end > rb->end) ? 1 : 0;
+}
+
+void gtf_table_sort(GtfTable *t)
+{
+    qsort(t->recs, t->n, sizeof(GtfRecord), rec_cmp);
+}
+
+/*
+ * Return the index of the first record whose seqname is >= target.
+ * This is the standard lower-bound binary search adapted for strings.
+ */
+static size_t lower_bound_seqname(const GtfTable *t, const char *target)
+{
+    size_t lo = 0, hi = t->n;
+    while (lo < hi) {
+        size_t mid = lo + (hi - lo) / 2;
+        if (strcmp(t->recs[mid].seqname, target) < 0)
+            lo = mid + 1;
+        else
+            hi = mid;
+    }
+    return lo;
+}
+
+GtfRecord **gtf_table_query(const GtfTable *t, const char *seqname,
+                             long qstart, long qend, size_t *count)
+{
+    *count = 0;
+
+    /* Jump to the first record whose seqname >= target */
+    size_t lo = lower_bound_seqname(t, seqname);
+
+    size_t cap = 16;
+    GtfRecord **hits = malloc(cap * sizeof(GtfRecord *));
+    if (!hits) return NULL;
+
+    for (size_t i = lo; i < t->n; i++) {
+        int cmp = strcmp(t->recs[i].seqname, seqname);
+        if (cmp > 0) break;           /* past target seqname — done */
+        if (t->recs[i].start > qend) break; /* sorted by start: no more overlaps */
+        if (t->recs[i].end < qstart)  continue; /* starts in range but ends before query */
+
+        if (*count >= cap) {
+            cap *= 2;
+            GtfRecord **tmp = realloc(hits, cap * sizeof(GtfRecord *));
+            if (!tmp) { free(hits); *count = 0; return NULL; }
+            hits = tmp;
+        }
+        hits[(*count)++] = &t->recs[i];
+    }
+
+    if (*count == 0) { free(hits); return NULL; }
+    return hits;
 }
 
 /* ------------------------------------------------------------------ */
@@ -215,6 +293,75 @@ void gtf_attrs_free(GtfAttrs *a)
     }
     free(a->pairs);
     free(a);
+}
+
+/*
+ * GFF3 attributes column: key=value;key=value;...
+ * Keys and values are unquoted.  Values may be comma-separated lists;
+ * the whole list is stored as a single string.
+ * Percent-encoded characters (%XX) are left encoded — see README for details.
+ */
+GtfAttrs *gff3_attrs_parse(const char *raw)
+{
+    GtfAttrs *a = malloc(sizeof(GtfAttrs));
+    if (!a) return NULL;
+
+    a->n = 0;
+    size_t cap = GTF_ATTRS_INIT_CAP;
+    a->pairs = malloc(cap * sizeof(GtfAttr));
+    if (!a->pairs) { free(a); return NULL; }
+
+    const char *p = raw;
+    while (*p) {
+        while (*p == ' ' || *p == '\t') p++;
+        if (!*p) break;
+
+        /* locate the end of this key=value token (next ';' or end) */
+        const char *tok_end = p;
+        while (*tok_end && *tok_end != ';') tok_end++;
+
+        /* locate the '=' separator within the token */
+        const char *eq = p;
+        while (eq < tok_end && *eq != '=') eq++;
+
+        if (eq == tok_end) {
+            /* no '=' — bare tag with no value; store with empty value */
+            char *key = strndup_safe(p, (size_t)(tok_end - p));
+            if (!key) { gtf_attrs_free(a); return NULL; }
+            char *value = strndup_safe("", 0);
+            if (!value) { free(key); gtf_attrs_free(a); return NULL; }
+
+            if (a->n >= cap) {
+                cap *= 2;
+                GtfAttr *tmp = realloc(a->pairs, cap * sizeof(GtfAttr));
+                if (!tmp) { free(key); free(value); gtf_attrs_free(a); return NULL; }
+                a->pairs = tmp;
+            }
+            a->pairs[a->n].key   = key;
+            a->pairs[a->n].value = value;
+            a->n++;
+        } else {
+            char *key   = strndup_safe(p, (size_t)(eq - p));
+            if (!key) { gtf_attrs_free(a); return NULL; }
+            char *value = strndup_safe(eq + 1, (size_t)(tok_end - eq - 1));
+            if (!value) { free(key); gtf_attrs_free(a); return NULL; }
+
+            if (a->n >= cap) {
+                cap *= 2;
+                GtfAttr *tmp = realloc(a->pairs, cap * sizeof(GtfAttr));
+                if (!tmp) { free(key); free(value); gtf_attrs_free(a); return NULL; }
+                a->pairs = tmp;
+            }
+            a->pairs[a->n].key   = key;
+            a->pairs[a->n].value = value;
+            a->n++;
+        }
+
+        p = tok_end;
+        if (*p == ';') p++;
+    }
+
+    return a;
 }
 
 void gtf_print(const GtfRecord *rec)

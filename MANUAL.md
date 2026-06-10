@@ -20,6 +20,9 @@ Written alongside the code as a learning companion.
 11. [GtfTable — a dynamic array of records](#11-gtftable--a-dynamic-array-of-records)
 12. [filter — using GtfTable in a command](#12-filter--using-gtftable-in-a-command)
 13. [GtfAttrs — parsing the attributes column](#13-gtfattrs--parsing-the-attributes-column)
+14. [GFF3 support — a second file format](#14-gff3-support--a-second-file-format)
+15. [gtf_table_sort — sorting records by position](#15-gtf_table_sort--sorting-records-by-position)
+16. [gtf_table_query — interval overlap queries](#16-gtf_table_query--interval-overlap-queries)
 
 ---
 
@@ -1429,6 +1432,19 @@ string character by character each time it needed a value. `GtfAttrs`
 (see section 13) provides a public API in the `gtf.c` layer: parse once,
 look up by key, free when done. The `attrs` command demonstrates it.
 
+### GFF3 support — addressed in Step 6
+
+`gtf_table_load` now detects the `##gff-version` pragma and sets
+`t->format = GTF_FMT_GFF3`. It also stops at `##FASTA` rather than trying
+to parse sequence data as annotation records. `gff3_attrs_parse` handles
+the `key=value;` attribute syntax. See section 14.
+
+### Sorting and interval queries — addressed in Steps 5 and 7
+
+`gtf_table_sort` sorts the table in place by `(seqname, start, end)`.
+`gtf_table_query` uses binary search to locate a chromosome then scans
+forward, giving O(log n + k) per query. See sections 15 and 16.
+
 ### `stats.c` loads all exon records into memory
 
 `gtf_exon_intron_stats` reads all exon lines before computing anything.
@@ -1588,8 +1604,9 @@ counts to `stderr`.
 memory. The reason to use `GtfTable` here is consistency: every command in
 this tool works from an in-memory table, which means any command can later
 be extended to make a second pass without changing its file-reading logic.
-When Step 5 (sort) is added, the table will be sorted in place after loading
-— a second pass for free.
+The `overlap` command (section 16) shows this payoff: it sorts the table in
+place after loading, then binary-searches it — a step that would be impossible
+without the whole file in memory.
 
 **`strcmp` on a struct field.** `t->recs[i].feature` is a `char` array
 embedded in the `GtfRecord`. `strcmp` takes two `const char *` arguments —
@@ -1856,3 +1873,378 @@ making it safe to `paste` with other per-record output or process with `awk`.
 non-NULL pointer. If `gtf_attrs_get` returned `NULL` and we printed it
 directly, the behaviour would be undefined (and typically a crash on most
 platforms). The ternary ensures a valid pointer is always passed.
+
+---
+
+## 14. GFF3 support — a second file format
+
+### GTF vs GFF3
+
+GTF and GFF3 share the same nine-column tab-delimited structure. The
+differences that matter for parsing are entirely in the attributes column
+and in a handful of pragma lines that appear at the top of GFF3 files.
+
+| Aspect | GTF | GFF3 |
+|--------|-----|------|
+| Attribute separator | `;` between pairs | `;` between pairs |
+| Key/value separator | space: `key "value"` | equals sign: `key=value` |
+| Value quoting | always double-quoted | never quoted |
+| Pragma lines | none | `##gff-version`, `##FASTA`, etc. |
+| Embedded sequences | never | optional `##FASTA` section at end |
+
+Because the nine columns are identical, `gtf_parse_line` works for GFF3
+lines without any changes — the raw attribute string is stored as-is
+regardless of format.
+
+### The `GtfFormat` enum
+
+```c
+typedef enum { GTF_FMT_GTF = 0, GTF_FMT_GFF3 = 1 } GtfFormat;
+```
+
+An `enum` (enumeration) assigns names to integer constants. `GTF_FMT_GTF`
+has value `0` and `GTF_FMT_GFF3` has value `1`. Using named constants
+instead of raw integers makes code self-documenting and lets the compiler
+warn if a switch statement omits a case.
+
+The `= 0` initialiser on `GTF_FMT_GTF` means that a zero-initialised
+`GtfTable` (e.g. from `calloc` or a `= {0}` initialiser) defaults to GTF
+format — the safer assumption when no pragma has been seen.
+
+`GtfTable` gains a `format` field of this type. Every command that parses
+attributes (`cmd_attrs`) reads it to choose the right parser.
+
+### Format detection in `gtf_table_load`
+
+```c
+while (fgets(line, sizeof(line), fp)) {
+    if (strncmp(line, "##FASTA", 7) == 0)
+        break;
+    if (strncmp(line, "##gff-version", 13) == 0) {
+        t->format = GTF_FMT_GFF3;
+        t->n_skipped++;
+        continue;
+    }
+    int ret = gtf_parse_line(line, &rec);
+    // ...
+}
+```
+
+Each line is inspected *before* being passed to `gtf_parse_line`. Two
+GFF3-specific cases are handled first:
+
+**`##FASTA` — break.** GFF3 files may embed the reference sequences after
+a `##FASTA` pragma. Everything after that line is FASTA, not annotation.
+`break` exits the loop immediately; `fgets` is never called again for this
+file. Without this check, `gtf_parse_line` would try to parse FASTA lines
+as nine-column records and report a flood of parse errors.
+
+**`##gff-version` — set format, continue.** The pragma is counted as a
+skipped line (it carries no record data) and the format flag is flipped.
+All subsequent attribute parsing will use `gff3_attrs_parse`.
+
+`strncmp(line, prefix, len)` compares only the first `len` characters,
+so it matches `##gff-version 3`, `##gff-version 3.1.25`, and any other
+version string equally well. The full pragma content is irrelevant — the
+presence of the prefix is what identifies GFF3.
+
+### `gff3_attrs_parse`
+
+```c
+GtfAttrs *gff3_attrs_parse(const char *raw)
+{
+    // ...
+    const char *p = raw;
+    while (*p) {
+        while (*p == ' ' || *p == '\t') p++;
+        if (!*p) break;
+
+        /* locate end of this token at the next ';' */
+        const char *tok_end = p;
+        while (*tok_end && *tok_end != ';') tok_end++;
+
+        /* locate the '=' separator within the token */
+        const char *eq = p;
+        while (eq < tok_end && *eq != '=') eq++;
+
+        if (eq == tok_end) {
+            /* bare tag with no value — store with empty value */
+        } else {
+            char *key   = strndup_safe(p,      eq - p);
+            char *value = strndup_safe(eq + 1, tok_end - eq - 1);
+            // store pair, grow array...
+        }
+
+        p = tok_end;
+        if (*p == ';') p++;
+    }
+    return a;
+}
+```
+
+The key structural difference from `gtf_attrs_parse` is how the token
+boundaries are found. GTF parsing walks character-by-character and extracts
+the value based on quote delimiters. GFF3 parsing instead locates the entire
+token boundary first (`tok_end` at the next `;`), then splits that token at
+the `=` sign.
+
+**Two-pointer scanning.** `tok_end` finds the end of the current
+`key=value` token. `eq` finds the `=` within it. Both scan forward from
+`p` and both are bounded: `tok_end` is bounded by the null terminator,
+`eq` is bounded by `tok_end`. Neither can overrun the string.
+
+**Bare tags.** Some GFF3 files include tags without values (e.g.
+`Is_circular`). When `eq == tok_end`, no `=` was found. Rather than
+skipping the tag silently, it is stored with an empty string value so
+callers can test for its presence with `gtf_attrs_get`.
+
+**Multi-value attributes.** GFF3 allows comma-separated values for one
+key: `Parent=mRNA:t1,mRNA:t2`. The entire comma-separated string is stored
+as a single value; splitting is intentionally left to the caller.
+
+**Percent-encoding.** The GFF3 spec requires certain characters (`;`, `=`,
+`%`, `&`, `,`) to be percent-encoded when they appear inside values. This
+implementation does not decode them. For files from standard sources
+(NCBI, Ensembl) this is not an issue in practice.
+
+`gff3_attrs_parse` returns the same `GtfAttrs` type as `gtf_attrs_parse`.
+The same `gtf_attrs_get` and `gtf_attrs_free` functions work on both.
+
+---
+
+## 15. `gtf_table_sort` — sorting records by position
+
+### Why sort?
+
+An unsorted table supports only linear scan: to find all records overlapping
+a region you must examine every record. Sorting by position enables binary
+search: jump directly to the chromosome of interest, then scan only the
+records that could possibly overlap. For a file with a million records and
+a query that spans 100 of them, the difference is roughly 1,000,000
+comparisons vs ~20 (binary search) + 100 (scan).
+
+Sorting also groups all records from the same chromosome together, which is
+a prerequisite for the sweep-line algorithm used in `compare.c`.
+
+### The comparator
+
+```c
+static int rec_cmp(const void *a, const void *b)
+{
+    const GtfRecord *ra = (const GtfRecord *)a;
+    const GtfRecord *rb = (const GtfRecord *)b;
+    int c = strcmp(ra->seqname, rb->seqname);
+    if (c) return c;
+    if (ra->start != rb->start) return (ra->start < rb->start) ? -1 : 1;
+    return (ra->end < rb->end) ? -1 : (ra->end > rb->end) ? 1 : 0;
+}
+```
+
+`qsort` requires a comparator that returns negative, zero, or positive.
+The three keys are applied in priority order:
+
+1. **`seqname`** — `strcmp` already returns the right sign. Records on
+   different chromosomes are separated first.
+2. **`start`** — within a chromosome, earlier-starting records come first.
+   The ternary `(a < b) ? -1 : 1` is used instead of the tempting
+   subtraction `a - b` because subtraction can overflow: if `a` is a large
+   positive `long` and `b` is a large negative `long`, `a - b` wraps around
+   to a negative result, inverting the sort order silently.
+3. **`end`** — tiebreaker for records that start at the same position.
+   Shorter records sort before longer ones.
+
+**Lexicographic chromosome order.** `strcmp` sorts strings
+lexicographically, which means chromosome names sort as `chr1, chr10,
+chr11, chr2` rather than `chr1, chr2, chr10, chr11`. This is a known
+limitation of naive sorting. Tools like `bedtools` use a reference
+genome's chromosome order instead. For our purposes, what matters is
+consistency: `gtf_table_query` uses the same `strcmp` to binary-search, so
+the sort order and search order always agree.
+
+### `gtf_table_sort`
+
+```c
+void gtf_table_sort(GtfTable *t)
+{
+    qsort(t->recs, t->n, sizeof(GtfRecord), rec_cmp);
+}
+```
+
+A one-line wrapper. `qsort` sorts the array **in place** — the `GtfRecord`
+values physically move within `t->recs`. This has an important consequence:
+any pointer you took into the array before sorting (`GtfRecord *p =
+&t->recs[42]`) may now point to a completely different record. This is why
+`gtf_table_query` is always called *after* `gtf_table_sort`, and why
+`cmd_overlap` does not store any record pointers before sorting.
+
+`qsort` is not guaranteed to be stable (equal elements may appear in any
+order relative to each other). For our purposes this does not matter —
+records at identical `(seqname, start, end)` coordinates are duplicates
+from the annotation perspective.
+
+---
+
+## 16. `gtf_table_query` — interval overlap queries
+
+### The overlap condition
+
+Two intervals are defined to overlap when they share at least one point.
+For 1-based, fully-closed intervals `[a, b]` and `[c, d]`:
+
+```
+overlaps  iff  a <= d  AND  c <= b
+no overlap iff  a > d  OR   c > b
+```
+
+In our notation: record `r` overlaps query `[qstart, qend]` when
+`r.start <= qend AND r.end >= qstart`. This is the test applied inside
+`gtf_table_query`.
+
+### The lower-bound binary search
+
+```c
+static size_t lower_bound_seqname(const GtfTable *t, const char *target)
+{
+    size_t lo = 0, hi = t->n;
+    while (lo < hi) {
+        size_t mid = lo + (hi - lo) / 2;
+        if (strcmp(t->recs[mid].seqname, target) < 0)
+            lo = mid + 1;
+        else
+            hi = mid;
+    }
+    return lo;
+}
+```
+
+This is the **lower bound** pattern: find the first index where
+`seqname >= target`. It is distinct from `bsearch`, which finds *an*
+element equal to the key (and returns `NULL` if none exists). Lower bound
+always returns a valid index, even when the target is not present — it
+returns the position where the target *would* be inserted to keep the
+array sorted.
+
+The invariant the loop maintains is: every index `< lo` has
+`seqname < target`, and every index `>= hi` has `seqname >= target`.
+When `lo == hi`, that single position is the answer.
+
+**`lo + (hi - lo) / 2` vs `(lo + hi) / 2`.** Both compute the midpoint,
+but `(lo + hi)` can overflow when `lo` and `hi` are large `size_t` values
+near `SIZE_MAX`. Subtracting first and adding `lo` afterward keeps the
+intermediate value within bounds. This is a classic binary search bug;
+the safe form is always preferred.
+
+### `gtf_table_query`
+
+```c
+GtfRecord **gtf_table_query(const GtfTable *t, const char *seqname,
+                             long qstart, long qend, size_t *count)
+{
+    *count = 0;
+    size_t lo = lower_bound_seqname(t, seqname);
+
+    size_t cap = 16;
+    GtfRecord **hits = malloc(cap * sizeof(GtfRecord *));
+
+    for (size_t i = lo; i < t->n; i++) {
+        int cmp = strcmp(t->recs[i].seqname, seqname);
+        if (cmp > 0) break;                      /* (A) past target seqname */
+        if (t->recs[i].start > qend) break;      /* (B) start past query end */
+        if (t->recs[i].end < qstart) continue;   /* (C) ends before query start */
+
+        hits[(*count)++] = &t->recs[i];
+        // grow hits if needed...
+    }
+
+    if (*count == 0) { free(hits); return NULL; }
+    return hits;
+}
+```
+
+The loop starts at `lo` — the first record that could possibly be on the
+target chromosome — and uses three conditions to process the rest:
+
+**(A) `cmp > 0` — break.** The records are sorted by `(seqname, start)`.
+Once `seqname` is lexicographically greater than the target, every
+subsequent record is also on a later chromosome. There can be no more
+matches; stop immediately.
+
+**(B) `start > qend` — break.** Within the target chromosome, records are
+sorted by `start`. Once a record starts after the query ends, no subsequent
+record can overlap (their starts are even later). Stop immediately.
+
+**(C) `end < qstart` — continue.** This record starts within the query's
+coordinate range (`start <= qend`, since condition B did not fire), but it
+ends before the query begins. This seems contradictory, but consider a
+long query `[100, 9000]` and a tiny record `[150, 160]`: the record
+starts within range but ends long before the query starts... wait, that
+cannot happen because `qstart=100 <= end=160`.
+
+The actual scenario for (C): a query `[500, 600]` and a record `[200,
+300]`. The record starts before `qstart` but also ends before `qstart`.
+After `lower_bound_seqname`, `i` starts at the first record with the right
+chromosome — there may be many records that started before the query window
+and whose ends also fall before it. Condition (C) skips them individually
+while condition (B) will eventually cut off the scan once `start > qend`.
+
+**Result array: pointers, not copies.** `hits` is an array of `GtfRecord *`,
+each pointing directly into `t->recs`. No records are copied. This is cheap
+and avoids the need for a separate free loop over the records. The consequence
+is that the pointers become invalid the moment the table is sorted again or
+freed — the caller must use the results before either operation.
+
+**Returning `NULL` for zero results.** When `*count == 0`, the function
+frees the hits array and returns `NULL`. An empty array (non-NULL pointer,
+`*count == 0`) would also work, but `NULL` is idiomatic in C for "nothing
+found" and saves the caller from allocating and freeing an empty buffer.
+The caller checks `count > 0` before iterating, so the `NULL` case is
+handled naturally.
+
+### `cmd_overlap` — region string parsing
+
+```c
+static int cmd_overlap(FILE *fp, const char *region)
+{
+    const char *colon = strrchr(region, ':');
+    // ...
+    char seqname[GTF_FIELD_MAX];
+    memcpy(seqname, region, seqlen);
+    seqname[seqlen] = '\0';
+
+    long qstart, qend;
+    if (sscanf(colon + 1, "%ld-%ld", &qstart, &qend) != 2 || qstart > qend) { ... }
+
+    GtfTable *t = gtf_table_load(fp);
+    gtf_table_sort(t);
+
+    size_t count;
+    GtfRecord **hits = gtf_table_query(t, seqname, qstart, qend, &count);
+
+    for (size_t i = 0; i < count; i++)
+        gtf_print(hits[i]);
+
+    free(hits);
+    gtf_table_free(t);
+}
+```
+
+**`strrchr` vs `strchr`.** `strchr(s, c)` finds the *first* occurrence of
+`c` in `s`; `strrchr` finds the *last*. A seqname like `chr1:alt_loci`
+contains a colon, so `strchr` would split it at the wrong place. `strrchr`
+finds the colon that separates seqname from coordinates — the last one —
+and handles any number of colons in the seqname itself.
+
+**`sscanf(colon + 1, "%ld-%ld", &qstart, &qend)`.** `colon` points to the
+`:` character. `colon + 1` is a pointer to the character immediately after
+it — the start of the coordinate string `"1000-5000"`. `sscanf` reads two
+`long` integers separated by a literal `-`. The return value is the number
+of items successfully parsed; if it is not exactly `2`, the format is wrong.
+
+**`qstart > qend` validation.** An inverted range is a user error. The
+check is placed alongside the `sscanf` check so both validation conditions
+produce the same error-and-return path.
+
+**`free(hits)` but not the records.** After printing, only the hits array
+is freed — not the records it points to. Those belong to the table and will
+be freed by `gtf_table_free(t)`. Freeing a pointer you do not own corrupts
+the heap; freeing a pointer you do own exactly once is the rule.

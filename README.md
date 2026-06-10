@@ -7,9 +7,10 @@ files, built step by step as a C learning project.
 
 | Tool                  | Language | Description |
 |-----------------------|----------|-------------|
-| `gtfparse print`      | C        | Parse a GTF file and print it back out (round-trip validator) |
+| `gtfparse print`      | C        | Parse a GTF/GFF3 file and print it back out (round-trip validator) |
 | `gtfparse filter`     | C        | Print only records matching a given feature type |
-| `gtfparse attrs`      | C        | Extract one attribute value per record |
+| `gtfparse attrs`      | C        | Extract one attribute value per record (GTF and GFF3) |
+| `gtfparse overlap`    | C        | Find all records overlapping a genomic region |
 | `gtfparse stats`      | C        | Exon and intron statistics: counts, per-gene averages, single-exon rates |
 | `gtfparse compare`    | C        | Structural comparison of two GTFs by genomic coordinate and intron chain |
 | `compare_gtf.py`      | Python   | Compare two GTFs by gene/transcript ID; write filtered or merged output; Venn diagram |
@@ -38,45 +39,75 @@ pip install matplotlib matplotlib-venn
 ### print
 
 Parses every record and writes it back to stdout.
-Diagnostic counts (parsed / skipped / errors) go to stderr.
+Accepts both GTF and GFF3 — format is detected automatically from the
+`##gff-version 3` pragma.  Diagnostic counts go to stderr.
 
 ```sh
 ./gtfparse print file.gtf
+./gtfparse print file.gff3
 
 # Round-trip test — diff should be empty
 ./gtfparse print file.gtf > out.gtf
 diff <(grep -v '^#' file.gtf) out.gtf
 
 # Count records by feature type
-./gtfparse print file.gtf | awk '{print $3}' | sort | uniq -c | sort -rn
+./gtfparse print file.gff3 | awk '{print $3}' | sort | uniq -c | sort -rn
 ```
 
 ### filter
 
 Prints all records whose feature column matches the given type.
-Diagnostic counts (matched / total) go to stderr.
+Works with both GTF and GFF3.  Diagnostic counts go to stderr.
 
 ```sh
 ./gtfparse filter exon file.gtf
-./gtfparse filter CDS  file.gtf
+./gtfparse filter CDS  file.gff3
 ./gtfparse filter gene file.gtf > genes.gtf
+```
+
+### overlap
+
+Finds all records whose `[start, end]` interval overlaps a query region.
+Accepts `seqname:start-end` in 1-based fully-closed coordinates (the GTF/GFF3
+native coordinate system).  Loads the file into memory, sorts by position,
+then binary-searches to the target chromosome before scanning.
+
+```sh
+./gtfparse overlap chr1:1000000-2000000 file.gtf
+./gtfparse overlap NC_092344.1:31000-32000 file.gff3
+
+# How many features overlap a region?
+./gtfparse overlap chr1:1-5000000 file.gtf 2>&1 | grep ^hits
 ```
 
 ### attrs
 
 Parses the attributes column of every record and prints the value of the
 requested key, one line per record.  Prints `.` when the key is absent.
+Automatically uses GTF (`key "value";`) or GFF3 (`key=value;`) parsing
+based on the detected format.
 
 ```sh
-# List all unique gene IDs
+# GTF: list all unique gene IDs
 ./gtfparse attrs gene_id file.gtf | sort -u
 
-# Extract transcript IDs from exon records only
-./gtfparse filter exon file.gtf | ./gtfparse attrs transcript_id /dev/stdin
+# GFF3: list all unique feature IDs
+./gtfparse attrs ID file.gff3 | sort -u
+
+# Extract Parent IDs from exon records
+./gtfparse filter exon file.gff3 | ./gtfparse attrs Parent /dev/stdin
 
 # Count records per gene
 ./gtfparse attrs gene_id file.gtf | sort | uniq -c | sort -rn | head
 ```
+
+**Note on GFF3 multi-value attributes:** GFF3 allows comma-separated values
+(e.g. `Parent=mRNA:t1,mRNA:t2`).  The entire comma-separated string is
+returned as a single value; splitting is left to the caller.
+
+**Note on `stats` and `compare`:** these commands look for `gene_id` and
+`transcript_id` attributes in GTF format and will not produce meaningful
+results on GFF3 files.
 
 ### stats
 
@@ -214,6 +245,6 @@ Output modes:
 2. **Step 2** ✓ — Dynamic array of all records (`GtfTable`: heap-allocated, doubling-growth array; `gtf_table_load` / `gtf_table_free`)
 3. **Step 3** ✓ — Filter by feature type (`gtfparse filter <feature> <file.gtf>`)
 4. **Step 4** ✓ — Parse the attributes column into key/value pairs (`GtfAttr`/`GtfAttrs`; `gtf_attrs_parse` / `gtf_attrs_get` / `gtf_attrs_free`)
-5. **Step 5** — Sort records by position
-6. **Step 6** — GFF3 support
-7. **Step 7** — Interval overlap query
+5. **Step 5** ✓ — Sort records by position (`gtf_table_sort`: in-place `qsort` by seqname/start/end)
+6. **Step 6** ✓ — GFF3 support (`gff3_attrs_parse`; auto-detect via `##gff-version`; stop at `##FASTA`)
+7. **Step 7** ✓ — Interval overlap query (`gtf_table_query`: binary search to seqname block + forward scan; `gtfparse overlap seqname:start-end`)
